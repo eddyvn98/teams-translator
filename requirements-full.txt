@@ -1,0 +1,34 @@
+# Prerequisites
+Microsoft Teams Desktop App (cài sẵn)
+Python 3.8+ (https://www.python.org/downloads/)
+Windows 10/11
+
+# Các thư viện Python cần thiết
+## Core
+pystray==0.19.5
+Pillow==10.2.0
+PyQt6==6.6.1
+
+## Speech-to-Text
+SpeechRecognition==3.10.4
+PyAudio==0.2.14
+
+## Text-to-Speech
+pyttsx3==2.90
+
+## Translation
+googletrans==4.0.0rc1
+
+## Teams Automation
+pyautogui==0.9.54
+keyboard==0.13.5
+pyperclip==1.8.2
+
+## Audio Processing
+pydub==0.25.1
+sounddevice==0.4.6
+soundfile==0.12.1
+
+## Utilities
+python-dotenv==1.0.0
+requests==2.31.0
