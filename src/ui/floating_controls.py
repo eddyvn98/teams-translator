@@ -1,37 +1,5 @@
-from PyQt5.QtWidgets import QWidget, QPushButton
-from PyQt5.QtCore import Qt, QPoint
-
-
-class DragButton(QPushButton):
-    def __init__(self, text: str, owner_widget: "FloatingControlWidget"):
-        super().__init__(text, owner_widget)
-        self.owner_widget = owner_widget
-        self._press_pos = QPoint()
-        self._drag_started = False
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._press_pos = event.globalPos()
-            self._drag_started = False
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
-            delta = event.globalPos() - self._press_pos
-            if delta.manhattanLength() >= 6:
-                self._drag_started = True
-                self.owner_widget._dragging = True
-                self.owner_widget._drag_offset = event.globalPos() - self.owner_widget.frameGeometry().topLeft()
-                self.owner_widget.move(event.globalPos() - self.owner_widget._drag_offset)
-                event.accept()
-                return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self._drag_started:
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+from PyQt5.QtCore import QPoint, Qt
+from PyQt5.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget
 
 
 class FloatingControlWidget(QWidget):
@@ -40,45 +8,101 @@ class FloatingControlWidget(QWidget):
         self.app_ref = app_ref
         self._drag_offset = QPoint()
         self._dragging = False
+        self._capturing = False
         self.setWindowTitle("Teams Translator Controls")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self._build_ui()
-        self.resize(48, 48)
+        self.adjustSize()
 
     def _build_ui(self):
-        self.pause_btn = DragButton(">", self)
-        self.pause_btn.setGeometry(0, 0, 44, 44)
-        self.pause_btn.setCursor(Qt.PointingHandCursor)
-        self.pause_btn.clicked.connect(self._on_pause_resume_clicked)
-        self.pause_btn.setStyleSheet(
-            "QPushButton { background: #1f6feb; color: white; border: 0; border-radius: 22px; font-size: 16px; font-weight: 700; }"
-            "QPushButton:hover { background: #2f81f7; }"
-        )
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        self.exit_btn = QPushButton("x", self)
-        self.exit_btn.setGeometry(30, -2, 18, 18)
-        self.exit_btn.setCursor(Qt.PointingHandCursor)
-        self.exit_btn.clicked.connect(self.app_ref._quit)
-        self.exit_btn.setStyleSheet(
-            "QPushButton { background: #da3633; color: white; border: 1px solid rgba(255,255,255,160); border-radius: 9px; font-size: 11px; font-weight: 700; padding: 0; }"
-            "QPushButton:hover { background: #f85149; }"
-        )
+        self.card = QFrame(self)
+        self.card.setObjectName("controlPill")
+        layout = QHBoxLayout(self.card)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
 
-        self.setStyleSheet("background: transparent;")
+        self.status_dot = QLabel()
+        self.status_dot.setObjectName("statusDot")
+        self.status_dot.setFixedSize(9, 9)
+        layout.addWidget(self.status_dot)
+
+        self.pause_btn = self._make_button("Resume", "primaryButton", self._on_pause_resume_clicked)
+        self.caption_btn = self._make_button("Caption", "toolButton", self.app_ref._toggle_caption)
+        self.input_btn = self._make_button("Input", "toolButton", self.app_ref._toggle_live_input)
+        self.exit_btn = self._make_button("x", "closeButton", self.app_ref._quit)
+
+        for button in [self.pause_btn, self.caption_btn, self.input_btn, self.exit_btn]:
+            layout.addWidget(button)
+
+        root.addWidget(self.card)
+        self._apply_style()
+
+    def _make_button(self, text: str, object_name: str, callback) -> QPushButton:
+        button = QPushButton(text, self.card)
+        button.setObjectName(object_name)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(callback)
+        return button
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            """
+            #controlPill {
+                background: rgba(15, 23, 42, 235);
+                border: 1px solid rgba(148, 163, 184, 130);
+                border-radius: 18px;
+            }
+            #statusDot {
+                background: #64748b;
+                border-radius: 4px;
+            }
+            #primaryButton, #toolButton, #closeButton {
+                color: #e2e8f0;
+                background: rgba(51, 65, 85, 190);
+                border: 1px solid rgba(148, 163, 184, 80);
+                border-radius: 12px;
+                padding: 6px 10px;
+                font: 700 11px "Segoe UI";
+            }
+            #primaryButton {
+                min-width: 70px;
+            }
+            #primaryButton:hover, #toolButton:hover {
+                background: rgba(71, 85, 105, 230);
+            }
+            #closeButton {
+                min-width: 24px;
+                padding-left: 7px;
+                padding-right: 7px;
+            }
+            #closeButton:hover {
+                background: #dc2626;
+                border-color: #ef4444;
+            }
+            """
+        )
 
     def sync_state(self, capturing: bool):
+        self._capturing = capturing
         if capturing:
-            self.pause_btn.setText("||")
+            self.pause_btn.setText("Pause")
+            self.status_dot.setStyleSheet("background: #22c55e; border-radius: 4px;")
             self.pause_btn.setStyleSheet(
-                "QPushButton { background: #f59e0b; color: #111; border: 0; border-radius: 22px; font-size: 14px; font-weight: 800; }"
+                "QPushButton { color: #111827; background: #f59e0b; border: 1px solid #fbbf24; "
+                "border-radius: 12px; padding: 6px 10px; font: 800 11px 'Segoe UI'; min-width: 70px; }"
                 "QPushButton:hover { background: #fbbf24; }"
             )
         else:
-            self.pause_btn.setText(">")
+            self.pause_btn.setText("Resume")
+            self.status_dot.setStyleSheet("background: #64748b; border-radius: 4px;")
             self.pause_btn.setStyleSheet(
-                "QPushButton { background: #1f6feb; color: white; border: 0; border-radius: 22px; font-size: 16px; font-weight: 700; }"
-                "QPushButton:hover { background: #2f81f7; }"
+                "QPushButton { color: white; background: #2563eb; border: 1px solid #3b82f6; "
+                "border-radius: 12px; padding: 6px 10px; font: 800 11px 'Segoe UI'; min-width: 70px; }"
+                "QPushButton:hover { background: #1d4ed8; }"
             )
 
     def _on_pause_resume_clicked(self):
@@ -89,19 +113,19 @@ class FloatingControlWidget(QWidget):
             self._dragging = True
             self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
-        else:
-            super().mousePressEvent(event)
+            return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._dragging and (event.buttons() & Qt.LeftButton):
             self.move(event.globalPos() - self._drag_offset)
             event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._dragging = False
             event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+            return
+        super().mouseReleaseEvent(event)

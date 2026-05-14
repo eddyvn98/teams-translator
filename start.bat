@@ -1,22 +1,25 @@
 @echo off
 title Teams Translator - Caption Meeting
+cd /d "%~dp0"
 
 echo ============================================
-echo    Teams Translator - Dịch real-time Anh-Việt
+echo    Teams Translator - Dich real-time Anh-Viet
 echo ============================================
 echo.
-echo Dang khoi dong...
-echo Neu bi chan boi Windows Defender, chon "More info" - "Run anyway"
+echo Dang khoi dong bang .venv local...
 echo.
 
-cd /d "D:\teams-translator"
-
-:: Dùng venv của hermes-agent đã cài đủ thư viện
-call "D:\hermes\hermes-agent\venv\Scripts\python.exe" run.py
+REM Dung python tu thu muc ao .venv vua tao
+if exist .venv\Scripts\python.exe (
+    .venv\Scripts\python.exe run.py
+) else (
+    echo ❌ Khong tim thay moi truong ao .venv!
+    echo Vui long chay lai file setup truoc.
+    pause
+)
 
 if %errorlevel% neq 0 (
     echo.
     echo === CO LOI XAY RA ===
-    echo Thu chay thu cong: python run.py
     pause
 )

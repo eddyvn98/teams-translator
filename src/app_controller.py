@@ -91,6 +91,9 @@ class TeamsTranslatorApp:
         self._session_transcript = []
         self._session_started_at = time.time()
         self._last_summary_minute = -1
+        self._summary_lock = threading.Lock()
+        self._summary_worker_running = False
+        self._latest_summary_text = ""
         self._meeting_id = time.strftime("%Y%m%d-%H%M%S")
         self.meeting_store = MeetingStore(Path.home() / ".teams-translator" / "data", self._meeting_id)
 
@@ -491,37 +494,80 @@ class TeamsTranslatorApp:
         )
         if len(self._session_transcript) > 300:
             self._session_transcript = self._session_transcript[-300:]
-        self._maybe_update_summary()
+        self._kick_summary_worker()
 
     def _maybe_update_summary(self):
-        now = time.time()
-        if not self._status.get("capturing", False):
-            return
-        minute_index = int((now - self._session_started_at) // 60)
-        if minute_index <= self._last_summary_minute:
-            return
-        window_start = self._session_started_at + (minute_index * 60)
-        window_end = min(now, window_start + 60)
-        minute_rows = self.meeting_store.get_transcript_range(window_start, window_end, limit=250)
-        if not minute_rows:
-            return
-        text_blob = "\n".join((r.get("translated_text") or r.get("source_text") or "").strip() for r in minute_rows)
-        if len(text_blob.strip()) < 40:
-            return
-        self._last_summary_minute = minute_index
+        self._kick_summary_worker()
 
-        def worker():
-            summary = self._ai_helper.summarize_text(text_blob)
-            if summary:
+    def _kick_summary_worker(self):
+        """Start a background worker that catches up completed minute summaries."""
+        with self._summary_lock:
+            if self._summary_worker_running:
+                return
+            self._summary_worker_running = True
+        threading.Thread(target=self._summary_worker, daemon=True, name="Summary-Worker").start()
+
+    def _summary_worker(self):
+        """
+        Summarize completed minutes sequentially.
+
+        Minute N is summarized only after its 60-second window has ended. Each summary
+        uses the previous cumulative summary plus the new minute transcript, so the
+        visible summary grows through the session instead of replacing context randomly.
+        """
+        try:
+            while True:
+                next_minute = self._last_summary_minute + 1
+                window_start = self._session_started_at + (next_minute * 60)
+                window_end = window_start + 60
+                if time.time() < window_end:
+                    return
+
+                minute_rows = self.meeting_store.get_transcript_range(window_start, window_end, limit=300)
+                text_blob = "\n".join(
+                    (r.get("translated_text") or r.get("source_text") or "").strip()
+                    for r in minute_rows
+                    if (r.get("translated_text") or r.get("source_text") or "").strip()
+                ).strip()
+
+                if len(text_blob) < 40:
+                    self._last_summary_minute = next_minute
+                    logger.info(f"Skip summary minute={next_minute}: not enough transcript")
+                    continue
+
+                if self._latest_summary_text:
+                    summary_input = (
+                        "Tom tat hien tai cua phien hop:\n"
+                        f"{self._latest_summary_text}\n\n"
+                        f"Noi dung moi trong phut {next_minute + 1}:\n"
+                        f"{text_blob}\n\n"
+                        "Hay cap nhat tom tat phien hop, giu cac y quan trong cu va them y moi."
+                    )
+                else:
+                    summary_input = (
+                        f"Noi dung phut {next_minute + 1} cua phien hop:\n"
+                        f"{text_blob}\n\n"
+                        "Hay tao tom tat ban dau cua phien hop."
+                    )
+
+                summary = self._ai_helper.summarize_text(summary_input)
+                if not summary:
+                    logger.warning(f"Summary minute={next_minute} returned empty")
+                    return
+
+                self._latest_summary_text = summary
+                self._last_summary_minute = next_minute
                 self.caption_window.set_summary(summary)
                 self.meeting_store.upsert_minute_summary(
-                    minute_index=minute_index,
+                    minute_index=next_minute,
                     start_ts=window_start,
                     end_ts=window_end,
                     summary_text=summary,
                 )
-
-        threading.Thread(target=worker, daemon=True, name="Summary-Worker").start()
+                logger.info(f"Updated cumulative summary through minute={next_minute}")
+        finally:
+            with self._summary_lock:
+                self._summary_worker_running = False
 
     def generate_reply_from_vietnamese(self, vietnamese_input: str, user_role: str = "") -> dict:
         vi_text = (vietnamese_input or "").strip()
@@ -698,8 +744,22 @@ class TeamsTranslatorApp:
         """Khởi động app."""
         # Tự động kiểm tra loopback device khi start
         threading.Thread(target=self._auto_check, daemon=True).start()
+        self._summary_timer = QTimer()
+        self._summary_timer.timeout.connect(self._kick_summary_worker)
+        self._summary_timer.start(10000)
+        QTimer.singleShot(3500, self._auto_start_capture)
         logger.info("Teams Translator đã khởi động! Chọn chế độ trong system tray.")
         return self.app.exec()
+
+    def _auto_start_capture(self):
+        """Start loopback capture after startup so the app begins listening immediately."""
+        if self._status.get("capturing"):
+            return
+        self._start_capture()
+        self.act_capture.setText("â¹ï¸ Dá»«ng")
+        self._status["capturing"] = True
+        self.floating_controls.sync_state(capturing=True)
+        self._notify(f"â–¶ï¸ Äang láº¯ng nghe (cháº¿ Ä‘á»™ {self._get_mode_name()})")
 
     def _auto_check(self):
         """Kiểm tra thiết bị khi khởi động."""

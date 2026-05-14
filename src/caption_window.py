@@ -1,12 +1,23 @@
 """
-Caption Window - hien thi lich su caption theo phien va khung AI tom tat.
+Caption window: independent, resizable transcript and summary surface.
 """
-import logging
 import datetime
+import logging
 from pathlib import Path
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QApplication, QTextEdit
-from PyQt5.QtCore import Qt, QTimer, QPoint, pyqtSignal
-from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QBrush
+
+from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizeGrip,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +36,16 @@ class CaptionWindow(QWidget):
         self._session_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self._history_file = self._history_dir / f"session-{self._session_id}.log"
         self._summary_file = self._history_dir / f"session-{self._session_id}-summary.txt"
+        self._summary_collapsed = False
+        self._dragging = False
+        self._drag_pos = QPoint()
+        self._idle_seconds = 0
 
+        self.setWindowTitle("Teams Translator - Caption")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setMinimumSize(420, 240)
 
         self._setup_ui()
         self._load_position()
@@ -39,49 +56,153 @@ class CaptionWindow(QWidget):
         self._fade_timer = QTimer()
         self._fade_timer.timeout.connect(self._check_fade)
         self._fade_timer.start(1000)
-        self._idle_seconds = 0
-
-        self._dragging = False
-        self._drag_pos = QPoint()
 
     def _setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(6)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        self.lang_label = QLabel("Live Transcript")
-        self.lang_label.setFont(QFont("Segoe UI", 9))
-        self.lang_label.setStyleSheet("color: rgba(255,255,255,180); background: transparent;")
-        layout.addWidget(self.lang_label)
+        self.card = QFrame(self)
+        self.card.setObjectName("captionCard")
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.status_dot = QLabel()
+        self.status_dot.setFixedSize(9, 9)
+        self.status_dot.setObjectName("statusDot")
+        header.addWidget(self.status_dot)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        self.title_label = QLabel("Live Caption")
+        self.title_label.setObjectName("titleLabel")
+        self.lang_label = QLabel("Session Transcript")
+        self.lang_label.setObjectName("metaLabel")
+        title_box.addWidget(self.title_label)
+        title_box.addWidget(self.lang_label)
+        header.addLayout(title_box, 1)
+
+        self.mode_label = QLabel("LISTENING")
+        self.mode_label.setObjectName("modePill")
+        header.addWidget(self.mode_label)
+
+        self.summary_toggle = QPushButton("Summary")
+        self.summary_toggle.setObjectName("smallButton")
+        self.summary_toggle.clicked.connect(self._toggle_summary)
+        header.addWidget(self.summary_toggle)
+
+        self.min_btn = QPushButton("_")
+        self.min_btn.setObjectName("iconButton")
+        self.min_btn.clicked.connect(self.showMinimized)
+        header.addWidget(self.min_btn)
+
+        self.close_btn = QPushButton("x")
+        self.close_btn.setObjectName("closeButton")
+        self.close_btn.clicked.connect(self.hide)
+        header.addWidget(self.close_btn)
+        card_layout.addLayout(header)
 
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
-        self.history_view.setFont(QFont("Segoe UI", self._get_font_size()))
-        self.history_view.setStyleSheet(
-            "QTextEdit { color: rgba(240,240,240,255); background: rgba(0,0,0,40); border: 1px solid rgba(80,120,200,80); border-radius: 8px; }"
-        )
-        self.history_view.setPlaceholderText("Transcript se hien thi tai day...")
-        layout.addWidget(self.history_view, 5)
-
-        self.summary_title = QLabel("AI Tom Tat")
-        self.summary_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        self.summary_title.setStyleSheet("color: rgba(180,220,255,220); background: transparent;")
-        layout.addWidget(self.summary_title)
+        self.history_view.setObjectName("historyView")
+        self.history_view.setPlaceholderText("Transcript will appear here...")
+        card_layout.addWidget(self.history_view, 5)
 
         self.summary_view = QTextEdit()
         self.summary_view.setReadOnly(True)
-        self.summary_view.setFont(QFont("Segoe UI", max(10, self._get_font_size() - 1)))
-        self.summary_view.setStyleSheet(
-            "QTextEdit { color: rgba(255,255,255,235); background: rgba(10,25,45,120); border: 1px solid rgba(100,170,255,120); border-radius: 8px; }"
-        )
-        self.summary_view.setPlaceholderText("AI tom tat se cap nhat theo phien...")
-        layout.addWidget(self.summary_view, 3)
+        self.summary_view.setObjectName("summaryView")
+        self.summary_view.setPlaceholderText("AI summary will update during the session...")
+        card_layout.addWidget(self.summary_view, 2)
 
-        self.setLayout(layout)
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        self.resize_hint = QLabel("drag corner to resize")
+        self.resize_hint.setObjectName("resizeHint")
+        footer.addWidget(self.resize_hint)
+        self.grip = QSizeGrip(self.card)
+        footer.addWidget(self.grip)
+        card_layout.addLayout(footer)
 
-        w = self.config.get("caption_width", 700) if self.config else 700
-        h = self.config.get("caption_height", 420) if self.config else 420
+        root.addWidget(self.card)
+        self._apply_style()
+
+        w = self.config.get("caption_width", 720) if self.config else 720
+        h = self.config.get("caption_height", 360) if self.config else 360
         self.resize(w, h)
+
+    def _apply_style(self):
+        font_size = self._get_font_size()
+        self.history_view.setFont(QFont("Segoe UI", font_size))
+        self.summary_view.setFont(QFont("Segoe UI", max(10, font_size - 1)))
+        self.setStyleSheet(
+            """
+            #captionCard {
+                background: rgba(14, 18, 27, 232);
+                border: 1px solid rgba(123, 164, 255, 120);
+                border-radius: 14px;
+            }
+            #statusDot {
+                background: #22c55e;
+                border-radius: 4px;
+            }
+            #titleLabel {
+                color: #f8fafc;
+                font: 700 13px "Segoe UI";
+            }
+            #metaLabel, #resizeHint {
+                color: rgba(203, 213, 225, 170);
+                font: 10px "Segoe UI";
+            }
+            #modePill {
+                color: #bbf7d0;
+                background: rgba(34, 197, 94, 35);
+                border: 1px solid rgba(34, 197, 94, 95);
+                border-radius: 8px;
+                padding: 4px 8px;
+                font: 700 10px "Segoe UI";
+            }
+            #historyView, #summaryView {
+                color: #f8fafc;
+                background: rgba(15, 23, 42, 170);
+                border: 1px solid rgba(148, 163, 184, 75);
+                border-radius: 10px;
+                padding: 8px;
+                selection-background-color: #2563eb;
+            }
+            #summaryView {
+                color: #dbeafe;
+                background: rgba(30, 41, 59, 185);
+            }
+            #smallButton, #iconButton, #closeButton {
+                color: #e2e8f0;
+                background: rgba(51, 65, 85, 180);
+                border: 1px solid rgba(148, 163, 184, 90);
+                border-radius: 8px;
+                padding: 5px 9px;
+                font: 600 11px "Segoe UI";
+            }
+            #smallButton:hover, #iconButton:hover {
+                background: rgba(71, 85, 105, 220);
+            }
+            #closeButton:hover {
+                background: #dc2626;
+                border-color: #ef4444;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(148, 163, 184, 120);
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            """
+        )
 
     def _get_font_size(self) -> int:
         return self.config.get("caption_font_size", 14) if self.config else 14
@@ -96,22 +217,29 @@ class CaptionWindow(QWidget):
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            self.move(geo.center().x() - self.width() // 2, geo.center().y() - self.height() // 2)
+            self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
 
-    def _save_position(self):
+    def _save_geometry(self):
         if self.config:
             self.config.set("caption_x", self.x())
             self.config.set("caption_y", self.y())
+            self.config.set("caption_width", self.width())
+            self.config.set("caption_height", self.height())
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        opacity = self.config.get("caption_opacity", 0.9) if self.config else 0.9
-        color = QColor(0, 0, 0, int(255 * opacity))
-        painter.setBrush(QBrush(color))
-        painter.setPen(QPen(QColor(60, 120, 240, 100), 1))
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
+        painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), 16, 16)
         super().paintEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.width() < 560:
+            self.history_view.setFont(QFont("Segoe UI", max(11, self._get_font_size() - 2)))
+        else:
+            self.history_view.setFont(QFont("Segoe UI", self._get_font_size()))
+        self._save_geometry()
 
     def show_caption(self, data: dict):
         self._idle_seconds = 0
@@ -122,6 +250,11 @@ class CaptionWindow(QWidget):
 
     def set_summary(self, text: str):
         self.summary_signal.emit(text or "")
+
+    def _toggle_summary(self):
+        self._summary_collapsed = not self._summary_collapsed
+        self.summary_view.setVisible(not self._summary_collapsed)
+        self.summary_toggle.setText("Show summary" if self._summary_collapsed else "Summary")
 
     def _on_update_summary(self, text: str):
         if text and text.strip():
@@ -137,7 +270,7 @@ class CaptionWindow(QWidget):
         source_lang = data.get("source_lang", "en")
 
         lang_map = {"en": "EN", "vi": "VI", "unknown": "UNK"}
-        self.lang_label.setText(f"Session Transcript [{lang_map.get(source_lang, 'UNK')}]")
+        self.lang_label.setText(f"Transcript [{lang_map.get(source_lang, 'UNK')}]")
 
         now = datetime.datetime.now().strftime("%H:%M:%S")
         if source_text and target_text and source_text.lower() == target_text.lower():
@@ -161,8 +294,8 @@ class CaptionWindow(QWidget):
         self.raise_()
 
     def _get_opacity(self) -> float:
-        if self._idle_seconds > 30:
-            return max(0.3, 1.0 - (self._idle_seconds - 30) * 0.01)
+        if self._idle_seconds > 45:
+            return max(0.55, 1.0 - (self._idle_seconds - 45) * 0.01)
         return 1.0
 
     def _check_fade(self):
@@ -170,35 +303,42 @@ class CaptionWindow(QWidget):
         self.setWindowOpacity(self._get_opacity())
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.LeftButton and event.y() <= 48:
             self._dragging = True
             self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
             event.accept()
+            return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._dragging and event.buttons() == Qt.LeftButton:
             self.move(event.globalPos() - self._drag_pos)
             event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._dragging:
             self._dragging = False
-            self._save_position()
+            self._save_geometry()
             event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            self.move(geo.center().x() - self.width() // 2, geo.center().y() - self.height() // 2)
-            self._save_position()
+            self.resize(min(900, geo.width() - 80), 360)
+            self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
+            self._save_geometry()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.hide()
 
     def closeEvent(self, event):
-        self._save_position()
+        self._save_geometry()
         super().closeEvent(event)
 
     @property
@@ -212,5 +352,5 @@ class CaptionWindow(QWidget):
     def clear(self):
         self.history_view.clear()
         self.summary_view.clear()
-        self.lang_label.setText("")
+        self.lang_label.setText("Session Transcript")
         self._current_text = {"source": "", "translated": "", "lang": ""}
