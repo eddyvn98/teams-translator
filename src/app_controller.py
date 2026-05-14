@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction
 from PyQt5.QtCore import QTimer, Qt
@@ -18,6 +19,9 @@ from src.ui.floating_controls import FloatingControlWidget
 from src.ui.settings_window import SettingsWindow
 from src.ui.live_input_window import LiveInputWindow
 from src.qwen_stt import QwenSTT
+from src.meeting_store import MeetingStore
+from src.reply_assistant import ReplyAssistant
+from src.text_to_speech import TextToSpeech
 
 logger = logging.getLogger("TeamsTranslator")
 
@@ -39,6 +43,8 @@ class TeamsTranslatorApp:
         self.loopback = LoopbackCapture(self.config)
         self.teams = TeamsAgent(self.config)
         self._ai_helper = QwenSTT(self.config)
+        self.reply_assistant = ReplyAssistant(self.config)
+        self.tts = TextToSpeech(self.config)
 
         # Qt Application
         self.app = QApplication(sys.argv)
@@ -83,8 +89,10 @@ class TeamsTranslatorApp:
         self._ensure_icon()
         self._last_loopback_display = ""
         self._session_transcript = []
-        self._last_summary_at = 0.0
-        self._last_summarized_snapshot = ""
+        self._session_started_at = time.time()
+        self._last_summary_minute = -1
+        self._meeting_id = time.strftime("%Y%m%d-%H%M%S")
+        self.meeting_store = MeetingStore(Path.home() / ".teams-translator" / "data", self._meeting_id)
 
 
     def _set_caption_visible(self, visible: bool):
@@ -421,7 +429,7 @@ class TeamsTranslatorApp:
             result["target_text"] = result["display_text"]
         if self._status["caption"] and result.get("display_text"):
             self.caption_window.show_caption(result)
-            self._append_session_text(result.get("display_text", ""))
+            self._append_session_text(result)
 
     def _stabilize_loopback_text(self, text: str) -> str:
         """Giảm giật/lặp caption khi dùng micro-batch có overlap."""
@@ -452,7 +460,7 @@ class TeamsTranslatorApp:
         result = self.translator.translate_bidirectional(text, direction="auto")
         if self._status["caption"]:
             self.caption_window.show_caption(result)
-            self._append_session_text(result.get("display_text", ""))
+            self._append_session_text(result)
 
     def _on_teams_caption(self, text: str):
         """
@@ -464,39 +472,101 @@ class TeamsTranslatorApp:
         result = self.translator.translate_bidirectional(text, direction="en2vi")
         if self._status["caption"]:
             self.caption_window.show_caption(result)
-            self._append_session_text(result.get("display_text", ""))
+            self._append_session_text(result)
 
-    def _append_session_text(self, text: str):
-        clean = (text or "").strip()
+    def _append_session_text(self, result: dict):
+        source_text = (result.get("source_text") or "").strip()
+        target_text = (result.get("target_text") or "").strip()
+        source_lang = (result.get("source_lang") or "unknown").strip()
+        clean = target_text or source_text
         if not clean:
             return
         if self._session_transcript and self._session_transcript[-1] == clean:
             return
         self._session_transcript.append(clean)
+        self.meeting_store.append_transcript(
+            source_lang=source_lang,
+            source_text=source_text,
+            translated_text=target_text,
+        )
         if len(self._session_transcript) > 300:
             self._session_transcript = self._session_transcript[-300:]
         self._maybe_update_summary()
 
     def _maybe_update_summary(self):
         now = time.time()
-        if now - self._last_summary_at < 60:
-            return
         if not self._status.get("capturing", False):
             return
-        self._last_summary_at = now
-        text_blob = "\n".join(self._session_transcript[-80:])
-        if len(text_blob) < 80:
+        minute_index = int((now - self._session_started_at) // 60)
+        if minute_index <= self._last_summary_minute:
             return
-        if text_blob == self._last_summarized_snapshot:
+        window_start = self._session_started_at + (minute_index * 60)
+        window_end = min(now, window_start + 60)
+        minute_rows = self.meeting_store.get_transcript_range(window_start, window_end, limit=250)
+        if not minute_rows:
             return
+        text_blob = "\n".join((r.get("translated_text") or r.get("source_text") or "").strip() for r in minute_rows)
+        if len(text_blob.strip()) < 40:
+            return
+        self._last_summary_minute = minute_index
 
         def worker():
             summary = self._ai_helper.summarize_text(text_blob)
             if summary:
                 self.caption_window.set_summary(summary)
-                self._last_summarized_snapshot = text_blob
+                self.meeting_store.upsert_minute_summary(
+                    minute_index=minute_index,
+                    start_ts=window_start,
+                    end_ts=window_end,
+                    summary_text=summary,
+                )
 
         threading.Thread(target=worker, daemon=True, name="Summary-Worker").start()
+
+    def generate_reply_from_vietnamese(self, vietnamese_input: str, user_role: str = "") -> dict:
+        vi_text = (vietnamese_input or "").strip()
+        if not vi_text:
+            return {"english_reply": "", "vietnamese_translation": "", "speaking_script": ""}
+        translated = self.translator.translate_bidirectional(vi_text, direction="vi2en")
+        question_en = (translated.get("target_text") or "").strip() or vi_text
+        return self._generate_contextual_reply(question_en, user_role=user_role)
+
+    def generate_auto_reply(self, user_role: str = "") -> dict:
+        recent = self.meeting_store.get_recent_transcripts(limit=25)
+        if not recent:
+            return {"english_reply": "", "vietnamese_translation": "", "speaking_script": ""}
+        latest_question = (recent[-1].get("source_text") or recent[-1].get("translated_text") or "").strip()
+        return self._generate_contextual_reply(latest_question, user_role=user_role)
+
+    def _generate_contextual_reply(self, latest_question: str, user_role: str = "") -> dict:
+        summaries = [s.get("summary_text", "").strip() for s in self.meeting_store.get_recent_summaries(limit=3)]
+        recent_rows = self.meeting_store.get_recent_transcripts(limit=60)
+        transcript_lines = []
+        for row in recent_rows[-30:]:
+            en = (row.get("source_text") or "").strip()
+            vi = (row.get("translated_text") or "").strip()
+            if en and vi and en.lower() != vi.lower():
+                transcript_lines.append(f"EN: {en}")
+                transcript_lines.append(f"VI: {vi}")
+            elif vi:
+                transcript_lines.append(vi)
+            elif en:
+                transcript_lines.append(en)
+        role = (user_role or "").strip() or "professional meeting participant"
+        return self.reply_assistant.generate_context_reply(
+            latest_question=latest_question,
+            summaries=summaries,
+            transcript_lines=transcript_lines,
+            user_role=role,
+        )
+
+    def speak_english_reply(self, reply_payload: dict):
+        text = (
+            (reply_payload.get("speaking_script") or "").strip()
+            or (reply_payload.get("english_reply") or "").strip()
+        )
+        if text:
+            self.tts.speak(text, wait=False)
 
     # ============ UI ACTIONS ============
 

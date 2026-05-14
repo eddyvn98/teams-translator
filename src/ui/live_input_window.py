@@ -28,7 +28,7 @@ class LiveInputWindow(QWidget):
     def _build_ui(self):
         self.setWindowTitle("VN -> EN Composer")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.resize(460, 230)
+        self.resize(560, 430)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -49,10 +49,36 @@ class LiveInputWindow(QWidget):
         self.translate_btn.clicked.connect(self.translate_and_inject)
         btn_row.addWidget(self.translate_btn)
 
+        self.reply_btn = QPushButton("Reply tu VN (co context)")
+        self.reply_btn.clicked.connect(self.generate_reply_from_vn)
+        btn_row.addWidget(self.reply_btn)
+
+        self.auto_reply_btn = QPushButton("Auto Reply")
+        self.auto_reply_btn.clicked.connect(self.generate_auto_reply)
+        btn_row.addWidget(self.auto_reply_btn)
+
+        self.speak_btn = QPushButton("Speak EN")
+        self.speak_btn.clicked.connect(self.speak_reply)
+        btn_row.addWidget(self.speak_btn)
+
         self.clear_btn = QPushButton("Xoa")
         self.clear_btn.clicked.connect(self.vn_input.clear)
         btn_row.addWidget(self.clear_btn)
         layout.addLayout(btn_row)
+
+        self.reply_en = QTextEdit()
+        self.reply_en.setReadOnly(True)
+        self.reply_en.setPlaceholderText("English reply se hien thi o day...")
+        self.reply_en.setFont(QFont("Segoe UI", 10))
+        layout.addWidget(self.reply_en, 1)
+
+        self.reply_vi = QTextEdit()
+        self.reply_vi.setReadOnly(True)
+        self.reply_vi.setPlaceholderText("Ban dich tieng Viet de tham khao...")
+        self.reply_vi.setFont(QFont("Segoe UI", 10))
+        layout.addWidget(self.reply_vi, 1)
+
+        self._last_reply_payload = {}
 
     def update_target_position(self, x: int, y: int):
         self.target_pos = (x, y)
@@ -83,6 +109,36 @@ class LiveInputWindow(QWidget):
         except Exception as e:
             logger.exception("Inject text failed")
             self.status_label.setText(f"Loi chen text: {e}")
+
+    def generate_reply_from_vn(self):
+        source_text = self.vn_input.toPlainText().strip()
+        if not source_text:
+            self.status_label.setText("Chua co noi dung de tao cau tra loi.")
+            return
+        payload = self.app_ref.generate_reply_from_vietnamese(source_text)
+        self._render_reply(payload, source="manual")
+
+    def generate_auto_reply(self):
+        payload = self.app_ref.generate_auto_reply()
+        self._render_reply(payload, source="auto")
+
+    def speak_reply(self):
+        if not self._last_reply_payload:
+            self.status_label.setText("Chua co reply de doc.")
+            return
+        self.app_ref.speak_english_reply(self._last_reply_payload)
+        self.status_label.setText("Dang phat TTS tieng Anh...")
+
+    def _render_reply(self, payload: dict, source: str):
+        english = (payload.get("english_reply") or "").strip()
+        vietnamese = (payload.get("vietnamese_translation") or "").strip()
+        if not english:
+            self.status_label.setText("Khong tao duoc reply. Kiem tra API key/model.")
+            return
+        self._last_reply_payload = payload
+        self.reply_en.setPlainText(english)
+        self.reply_vi.setPlainText(vietnamese)
+        self.status_label.setText(f"Da tao {source} reply. Ban co the bam 'Speak EN' hoac chen vao input dich.")
 
     def _sanitize_for_target_input(self, text: str) -> str:
         """

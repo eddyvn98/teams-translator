@@ -1,5 +1,5 @@
-﻿"""
-Config Manager â€” quáº£n lÃ½ cáº¥u hÃ¬nh vÃ  cÃ i Ä‘áº·t
+"""
+Config Manager — quản lý cấu hình và cài đặt
 """
 import json
 import os
@@ -33,8 +33,8 @@ DEFAULT_CONFIG = {
 
     # Translation direction
     # "auto" = auto-detect input language
-    # "en2vi" = always English â†’ Vietnamese
-    # "vi2en" = always Vietnamese â†’ English
+    # "en2vi" = always English → Vietnamese
+    # "vi2en" = always Vietnamese → English
     "direction": "auto",
 
     # Caption window
