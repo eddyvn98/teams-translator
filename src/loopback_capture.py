@@ -93,9 +93,16 @@ class LoopbackCapture:
             logger.warning("Không tìm thấy loopback device nào!")
             return None
 
-        # Ưu tiên: Stereo Mix > WASAPI loopback (Speakers) > CABLE Output
-        # Stereo Mix: bắt trực tiếp âm thanh từ sound card, vẫn nghe được loa
-        # Stereo Mix thường có index 3, 12, 25, 27 trên máy này
+        # Ưu tiên:
+        # 1) CABLE Output (khi app phát ra CABLE Input)
+        # 2) Stereo Mix
+        # 3) WASAPI loopback Speakers/FxSound
+        for d in devices:
+            name_lower = d["name"].lower()
+            if "cable output (vb-audio virtual" in name_lower and d.get("channels", 0) >= 1:
+                logger.info(f"Tìm thấy CABLE Output VB-Audio: {d['name']} (index={d['index']})")
+                return d["index"]
+
         for d in devices:
             if "stereo mix" in d["name"].lower():
                 # Xác thực bằng sounddevice
@@ -122,16 +129,11 @@ class LoopbackCapture:
                     pass
                 logger.info(f"Tìm thấy Stereo Mix (PA): {d['name']} (index={d['index']})")
                 return d["index"]
-        # CABLE Output VB-Audio (đã test ổn)
+
         for d in devices:
             name_lower = d["name"].lower()
-            if "cable output (vb-audio virtual" in name_lower and d.get("channels", 0) >= 2:
-                logger.info(f"Tìm thấy CABLE Output VB-Audio: {d['name']} (index={d['index']})")
-                return d["index"]
-        # Stereo Mix
-        for d in devices:
-            if "stereo mix" in d["name"].lower() and d.get("channels", 0) >= 2:
-                logger.info(f"Tìm thấy Stereo Mix: {d['name']} (index={d['index']})")
+            if "wasapi loopback" in name_lower and any(k in name_lower for k in ["speakers", "headphones", "fxsound", "realtek", "output"]):
+                logger.info(f"Tìm thấy WASAPI loopback: {d['name']} (index={d['index']})")
                 return d["index"]
 
         # Fallback: device đầu tiên
@@ -188,13 +190,14 @@ class LoopbackCapture:
         import sounddevice as sd
         import time
         sample_rate = self._sample_rate
-        chunk_duration = 1.0
-        overlap_duration = 0.2
+        chunk_duration = 3.0
+        overlap_duration = 0.8
         chunk_samples = int(sample_rate * chunk_duration)
         overlap_samples = int(sample_rate * overlap_duration)
         prev_tail = np.array([], dtype=np.float32)
+        silence_skips = 0
 
-        logger.info("Bat dau loopback stream (Qwen STT, chunk=1.0s, overlap=0.2s)...")
+        logger.info("Bat dau loopback stream (Qwen STT, chunk=3.0s, overlap=0.8s)...")
 
         while not self._stop_event.is_set():
             try:
@@ -225,8 +228,16 @@ class LoopbackCapture:
 
                 # VAD
                 if not self._stt.has_energy(audio_send, threshold=0.003):
+                    silence_skips += 1
+                    if silence_skips % 10 == 0:
+                        peak = float(np.max(np.abs(audio_send))) if audio_send.size else 0.0
+                        logger.warning(
+                            f"Loopback no-audio chunks={silence_skips}, peak={peak:.5f}. "
+                            "Kiem tra output routing (CABLE Input <-> CABLE Output hoac Speakers)."
+                        )
                     prev_tail = audio_mono[-overlap_samples:] if audio_mono.size > overlap_samples else audio_mono
                     continue
+                silence_skips = 0
                 item = (audio_send.copy(), sample_rate, "en")
                 try:
                     self._audio_queue.put_nowait(item)

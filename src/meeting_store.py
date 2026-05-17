@@ -25,6 +25,15 @@ class MeetingStore:
         with self._connect() as conn:
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS meeting_sessions (
+                    meeting_id TEXT PRIMARY KEY,
+                    created_ts REAL NOT NULL,
+                    display_name TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     meeting_id TEXT NOT NULL,
@@ -49,6 +58,35 @@ class MeetingStore:
                 """
             )
             conn.commit()
+
+    def set_meeting(self, meeting_id: str):
+        self.meeting_id = (meeting_id or "").strip() or self.meeting_id
+
+    def register_session(
+        self,
+        meeting_id: str | None = None,
+        created_ts: float | None = None,
+        display_name: str | None = None,
+    ):
+        session_id = (meeting_id or self.meeting_id or "").strip()
+        if not session_id:
+            return
+        created = float(created_ts if created_ts is not None else time.time())
+        name = (display_name or "").strip() or f"Session {session_id}"
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO meeting_sessions (meeting_id, created_ts, display_name)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(meeting_id)
+                    DO UPDATE SET
+                        created_ts = MIN(meeting_sessions.created_ts, excluded.created_ts),
+                        display_name = COALESCE(NULLIF(excluded.display_name, ''), meeting_sessions.display_name)
+                    """,
+                    (session_id, created, name),
+                )
+                conn.commit()
 
     def append_transcript(
         self,
@@ -131,3 +169,76 @@ class MeetingStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_transcripts_by_meeting(self, meeting_id: str, limit: int = 2000) -> List[Dict[str, str]]:
+        mid = (meeting_id or "").strip()
+        if not mid:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, source_lang, source_text, translated_text
+                FROM transcripts
+                WHERE meeting_id = ?
+                ORDER BY ts ASC
+                LIMIT ?
+                """,
+                (mid, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_latest_summary_by_meeting(self, meeting_id: str) -> str:
+        mid = (meeting_id or "").strip()
+        if not mid:
+            return ""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT summary_text
+                FROM minute_summaries
+                WHERE meeting_id = ?
+                ORDER BY minute_index DESC
+                LIMIT 1
+                """,
+                (mid,),
+            ).fetchone()
+        return (dict(row).get("summary_text", "") if row else "").strip()
+
+    def list_sessions(self, limit: int = 100) -> List[Dict[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH transcript_stats AS (
+                    SELECT meeting_id, MIN(ts) AS first_ts, MAX(ts) AS last_ts, COUNT(*) AS transcript_count
+                    FROM transcripts
+                    GROUP BY meeting_id
+                ),
+                summary_stats AS (
+                    SELECT meeting_id, COUNT(*) AS summary_count
+                    FROM minute_summaries
+                    GROUP BY meeting_id
+                )
+                SELECT
+                    m.meeting_id AS meeting_id,
+                    m.created_ts AS created_ts,
+                    m.display_name AS display_name,
+                    COALESCE(t.transcript_count, 0) AS transcript_count,
+                    COALESCE(s.summary_count, 0) AS summary_count
+                FROM meeting_sessions m
+                LEFT JOIN transcript_stats t ON t.meeting_id = m.meeting_id
+                LEFT JOIN summary_stats s ON s.meeting_id = m.meeting_id
+                UNION
+                SELECT
+                    t.meeting_id AS meeting_id,
+                    COALESCE(t.first_ts, strftime('%s','now')) AS created_ts,
+                    '' AS display_name,
+                    COALESCE(t.transcript_count, 0) AS transcript_count,
+                    COALESCE(s.summary_count, 0) AS summary_count
+                FROM transcript_stats t
+                LEFT JOIN summary_stats s ON s.meeting_id = t.meeting_id
+                WHERE t.meeting_id NOT IN (SELECT meeting_id FROM meeting_sessions)
+                ORDER BY created_ts DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]

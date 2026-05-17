@@ -26,9 +26,10 @@ class CaptionWindow(QWidget):
     update_signal = pyqtSignal(dict)
     summary_signal = pyqtSignal(str)
 
-    def __init__(self, config_manager=None, parent=None):
+    def __init__(self, config_manager=None, parent=None, app_ref=None):
         super().__init__(parent)
         self.config = config_manager
+        self.app_ref = app_ref
         self._history = []
         self._current_text = {"source": "", "translated": "", "lang": ""}
         self._history_dir = Path.home() / ".teams-translator" / "history"
@@ -37,6 +38,7 @@ class CaptionWindow(QWidget):
         self._history_file = self._history_dir / f"session-{self._session_id}.log"
         self._summary_file = self._history_dir / f"session-{self._session_id}-summary.txt"
         self._summary_collapsed = False
+        self._summary_enabled = True
         self._dragging = False
         self._drag_pos = QPoint()
         self._idle_seconds = 0
@@ -92,6 +94,18 @@ class CaptionWindow(QWidget):
         self.summary_toggle.setObjectName("smallButton")
         self.summary_toggle.clicked.connect(self._toggle_summary)
         header.addWidget(self.summary_toggle)
+        self.summary_pause_btn = QPushButton("Pause")
+        self.summary_pause_btn.setObjectName("smallButton")
+        self.summary_pause_btn.clicked.connect(self._toggle_summary_updates)
+        header.addWidget(self.summary_pause_btn)
+        self.new_session_btn = QPushButton("New")
+        self.new_session_btn.setObjectName("smallButton")
+        self.new_session_btn.clicked.connect(self._new_session)
+        header.addWidget(self.new_session_btn)
+        self.history_btn = QPushButton("History")
+        self.history_btn.setObjectName("smallButton")
+        self.history_btn.clicked.connect(self._open_history)
+        header.addWidget(self.history_btn)
 
         self.min_btn = QPushButton("_")
         self.min_btn.setObjectName("iconButton")
@@ -256,6 +270,26 @@ class CaptionWindow(QWidget):
         self.summary_view.setVisible(not self._summary_collapsed)
         self.summary_toggle.setText("Show summary" if self._summary_collapsed else "Summary")
 
+    def _toggle_summary_updates(self):
+        if self.app_ref:
+            self.app_ref._toggle_summary_updates()
+
+    def _new_session(self):
+        if self.app_ref:
+            self.app_ref.start_new_session()
+
+    def _open_history(self):
+        if self.app_ref:
+            self.app_ref.open_session_history()
+
+    def set_summary_enabled(self, enabled: bool):
+        self._summary_enabled = bool(enabled)
+        self.summary_pause_btn.setText("Pause" if self._summary_enabled else "Resume")
+        if self._summary_enabled:
+            self.summary_pause_btn.setStyleSheet("")
+        else:
+            self.summary_pause_btn.setStyleSheet("QPushButton{background:#475569;color:#e2e8f0;}")
+
     def _on_update_summary(self, text: str):
         if text and text.strip():
             self.summary_view.setPlainText(text.strip())
@@ -349,8 +383,22 @@ class CaptionWindow(QWidget):
     def history(self) -> list:
         return list(self._history)
 
+    def start_new_session(self, session_id: str):
+        sid = (session_id or "").strip() or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self._session_id = sid
+        self._history_file = self._history_dir / f"session-{sid}.log"
+        self._summary_file = self._history_dir / f"session-{sid}-summary.txt"
+        self.clear()
+
+    def load_session_view(self, transcript_lines: list[str], summary_text: str):
+        self.history_view.setPlainText("\n".join(transcript_lines or []))
+        self.summary_view.setPlainText((summary_text or "").strip())
+        bar = self.history_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def clear(self):
         self.history_view.clear()
         self.summary_view.clear()
         self.lang_label.setText("Session Transcript")
         self._current_text = {"source": "", "translated": "", "lang": ""}
+        self._history = []

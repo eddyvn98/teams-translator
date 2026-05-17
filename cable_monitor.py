@@ -25,16 +25,44 @@ def find_device(name_part: str, kind: str, preferred_host: str = "WASAPI") -> in
     raise RuntimeError(f"Device not found: {name_part} ({kind})")
 
 
+def find_best_output_device(preferred_host: str = "WASAPI") -> int:
+    candidates = []
+    for index, device in enumerate(sd.query_devices()):
+        if device["max_output_channels"] <= 0:
+            continue
+        host = sd.query_hostapis(device["hostapi"])["name"]
+        name = device["name"].lower()
+        if "cable" in name:
+            continue
+
+        score = 0
+        if preferred_host.lower() in host.lower():
+            score += 5
+        if "realtek" in name:
+            score += 4
+        if "speakers" in name or "headphones" in name:
+            score += 3
+        if "fxsound" in name:
+            score += 2
+        candidates.append((score, index, device["name"], host))
+
+    if not candidates:
+        raise RuntimeError("No non-cable output device found")
+
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 def main() -> int:
     input_device = find_device("cable output", "input")
-    output_device = find_device("wuying", "output")
+    output_device = find_best_output_device()
     input_info = sd.query_devices(input_device)
     output_info = sd.query_devices(output_device)
     sample_rate = int(min(input_info["default_samplerate"], output_info["default_samplerate"]) or 48000)
     channels = 2
 
     print(
-        f"Monitoring CABLE Output [{input_device}] -> Wuying speaker [{output_device}] "
+        f"Monitoring CABLE Output [{input_device}] -> {output_info['name']} [{output_device}] "
         f"at {sample_rate}Hz",
         flush=True,
     )

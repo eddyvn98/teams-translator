@@ -3,9 +3,10 @@ import os
 import sys
 import threading
 import time
+import datetime
 from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QInputDialog
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QIcon, QCursor
 
@@ -53,7 +54,7 @@ class TeamsTranslatorApp:
         self.app.setApplicationDisplayName("Teams Translator - Caption Meeting")
 
         # Caption window
-        self.caption_window = CaptionWindow(self.config)
+        self.caption_window = CaptionWindow(self.config, app_ref=self)
         self.floating_controls = FloatingControlWidget(self)
         self.live_input_window = LiveInputWindow(self)
 
@@ -68,6 +69,8 @@ class TeamsTranslatorApp:
         # Trạng thái
         self._capture_mode = self.MODE_LOOPBACK  # Mặc định: loopback
         self._caption_enabled = True
+        self._caption_detached = False
+        self._summary_enabled = True
 
         # Connect callbacks
         self.loopback.set_on_result(self._on_loopback_result)
@@ -82,9 +85,14 @@ class TeamsTranslatorApp:
         }
         self.floating_controls.sync_state(capturing=False)
         self.floating_controls.move(20, 120)
-        self.floating_controls.show()
-        self.live_input_window.move(20, 190)
+        self.floating_controls.hide()
+        self.live_input_window.move(20, 40)
         self.live_input_window.show()
+        self.caption_window.hide()
+        self.live_input_window.set_capture_state(capturing=False)
+        self.live_input_window.set_caption_enabled(enabled=True)
+        self.live_input_window.set_summary_enabled(enabled=True)
+        self.live_input_window.set_detached_mode(detached=False)
 
         self._ensure_icon()
         self._last_loopback_display = ""
@@ -94,8 +102,14 @@ class TeamsTranslatorApp:
         self._summary_lock = threading.Lock()
         self._summary_worker_running = False
         self._latest_summary_text = ""
-        self._meeting_id = time.strftime("%Y%m%d-%H%M%S")
+        self._meeting_id = self._new_meeting_id()
+        self._session_token = 0
         self.meeting_store = MeetingStore(Path.home() / ".teams-translator" / "data", self._meeting_id)
+        self.meeting_store.register_session(
+            meeting_id=self._meeting_id,
+            created_ts=self._session_started_at,
+            display_name=self._session_display_name(self._meeting_id),
+        )
 
 
     def _set_caption_visible(self, visible: bool):
@@ -104,10 +118,14 @@ class TeamsTranslatorApp:
         self._status["caption"] = visible
         self.act_caption.setChecked(visible)
         if visible:
-            self.caption_window.show()
+            if self._caption_detached:
+                self.caption_window.show()
+            self.live_input_window.set_caption_enabled(True)
             self._notify("📺 Caption đã hiện lại")
         else:
-            self.caption_window.hide()
+            if self._caption_detached:
+                self.caption_window.hide()
+            self.live_input_window.set_caption_enabled(False)
             self._notify("📺 Caption đã ẩn (dùng Ctrl+Shift+C để hiện lại)")
 
     def _ensure_icon(self):
@@ -334,12 +352,14 @@ class TeamsTranslatorApp:
             self.act_capture.setText("▶️ Bắt đầu")
             self._status["capturing"] = False
             self.floating_controls.sync_state(capturing=False)
+            self.live_input_window.set_capture_state(capturing=False)
             self._notify("⏹️ Đã dừng")
         else:
             self._start_capture()
             self.act_capture.setText("⏹️ Dừng")
             self._status["capturing"] = True
             self.floating_controls.sync_state(capturing=True)
+            self.live_input_window.set_capture_state(capturing=True)
             self._notify(f"▶️ Đang lắng nghe (chế độ {self._get_mode_name()})")
 
     def _get_mode_name(self) -> str:
@@ -432,6 +452,7 @@ class TeamsTranslatorApp:
             result["target_text"] = result["display_text"]
         if self._status["caption"] and result.get("display_text"):
             self.caption_window.show_caption(result)
+            self.live_input_window.update_live_caption(result)
             self._append_session_text(result)
 
     def _stabilize_loopback_text(self, text: str) -> str:
@@ -463,6 +484,7 @@ class TeamsTranslatorApp:
         result = self.translator.translate_bidirectional(text, direction="auto")
         if self._status["caption"]:
             self.caption_window.show_caption(result)
+            self.live_input_window.update_live_caption(result)
             self._append_session_text(result)
 
     def _on_teams_caption(self, text: str):
@@ -475,6 +497,7 @@ class TeamsTranslatorApp:
         result = self.translator.translate_bidirectional(text, direction="en2vi")
         if self._status["caption"]:
             self.caption_window.show_caption(result)
+            self.live_input_window.update_live_caption(result)
             self._append_session_text(result)
 
     def _append_session_text(self, result: dict):
@@ -501,13 +524,21 @@ class TeamsTranslatorApp:
 
     def _kick_summary_worker(self):
         """Start a background worker that catches up completed minute summaries."""
+        if not self._summary_enabled:
+            return
+        token = self._session_token
         with self._summary_lock:
             if self._summary_worker_running:
                 return
             self._summary_worker_running = True
-        threading.Thread(target=self._summary_worker, daemon=True, name="Summary-Worker").start()
+        threading.Thread(
+            target=self._summary_worker,
+            args=(token,),
+            daemon=True,
+            name="Summary-Worker",
+        ).start()
 
-    def _summary_worker(self):
+    def _summary_worker(self, session_token: int):
         """
         Summarize completed minutes sequentially.
 
@@ -517,6 +548,10 @@ class TeamsTranslatorApp:
         """
         try:
             while True:
+                if session_token != self._session_token:
+                    return
+                if not self._summary_enabled:
+                    return
                 next_minute = self._last_summary_minute + 1
                 window_start = self._session_started_at + (next_minute * 60)
                 window_end = window_start + 60
@@ -554,10 +589,13 @@ class TeamsTranslatorApp:
                 if not summary:
                     logger.warning(f"Summary minute={next_minute} returned empty")
                     return
+                if session_token != self._session_token:
+                    return
 
                 self._latest_summary_text = summary
                 self._last_summary_minute = next_minute
                 self.caption_window.set_summary(summary)
+                self.live_input_window.update_ai_summary(summary)
                 self.meeting_store.upsert_minute_summary(
                     minute_index=next_minute,
                     start_ts=window_start,
@@ -568,6 +606,88 @@ class TeamsTranslatorApp:
         finally:
             with self._summary_lock:
                 self._summary_worker_running = False
+
+    def _new_meeting_id(self) -> str:
+        return time.strftime("%Y%m%d-%H%M%S")
+
+    def _session_display_name(self, meeting_id: str) -> str:
+        sid = (meeting_id or "").strip()
+        try:
+            dt = datetime.datetime.strptime(sid, "%Y%m%d-%H%M%S")
+            return f"Session {dt.strftime('%Y-%m-%d %H:%M:%S')}"
+        except Exception:
+            return f"Session {sid}"
+
+    def start_new_session(self):
+        self._meeting_id = self._new_meeting_id()
+        self._session_token += 1
+        self._session_transcript = []
+        self._session_started_at = time.time()
+        self._last_summary_minute = -1
+        self._latest_summary_text = ""
+        self.meeting_store.set_meeting(self._meeting_id)
+        self.meeting_store.register_session(
+            meeting_id=self._meeting_id,
+            created_ts=self._session_started_at,
+            display_name=self._session_display_name(self._meeting_id),
+        )
+        self.caption_window.start_new_session(self._meeting_id)
+        self.live_input_window.load_session_view([], "")
+        self._notify(f"Đã tạo session mới: {self._session_display_name(self._meeting_id)}")
+
+    def open_session_history(self):
+        sessions = self.meeting_store.list_sessions(limit=150)
+        if not sessions:
+            self._notify("Chưa có lịch sử session.")
+            return
+        labels = []
+        lookup = {}
+        for s in sessions:
+            meeting_id = (s.get("meeting_id") or "").strip()
+            if not meeting_id:
+                continue
+            display_name = (s.get("display_name") or "").strip() or self._session_display_name(meeting_id)
+            transcript_count = int(s.get("transcript_count") or 0)
+            summary_count = int(s.get("summary_count") or 0)
+            label = f"{display_name} | caption={transcript_count} | summary={summary_count}"
+            labels.append(label)
+            lookup[label] = meeting_id
+        if not labels:
+            self._notify("Chưa có lịch sử session.")
+            return
+
+        selected, ok = QInputDialog.getItem(
+            self.live_input_window,
+            "Session history",
+            "Chọn session để xem lại:",
+            labels,
+            0,
+            False,
+        )
+        if not ok or not selected:
+            return
+        meeting_id = lookup.get(selected)
+        if not meeting_id:
+            return
+        self._load_session_to_view(meeting_id)
+
+    def _load_session_to_view(self, meeting_id: str):
+        rows = self.meeting_store.get_transcripts_by_meeting(meeting_id, limit=4000)
+        summary_text = self.meeting_store.get_latest_summary_by_meeting(meeting_id)
+        transcript_lines = []
+        for row in rows:
+            en = (row.get("source_text") or "").strip()
+            vi = (row.get("translated_text") or "").strip()
+            if vi and en and vi.lower() != en.lower():
+                transcript_lines.append(f"EN: {en}")
+                transcript_lines.append(f"VI: {vi}")
+            elif vi:
+                transcript_lines.append(vi)
+            elif en:
+                transcript_lines.append(en)
+        self.live_input_window.load_session_view(transcript_lines, summary_text)
+        self.caption_window.load_session_view(transcript_lines, summary_text)
+        self._notify(f"Đã mở lịch sử: {self._session_display_name(meeting_id)}")
 
     def generate_reply_from_vietnamese(self, vietnamese_input: str, user_role: str = "") -> dict:
         vi_text = (vietnamese_input or "").strip()
@@ -621,21 +741,63 @@ class TeamsTranslatorApp:
         self.act_caption.setChecked(self._caption_enabled)
         self._status["caption"] = self._caption_enabled
         if self._caption_enabled:
-            self.caption_window.show()
+            if self._caption_detached:
+                self.caption_window.show()
+            self.live_input_window.set_caption_enabled(True)
             self._notify("📺 Caption overlay đã bật")
         else:
-            self.caption_window.hide()
+            if self._caption_detached:
+                self.caption_window.hide()
+            self.live_input_window.set_caption_enabled(False)
             self._notify("📺 Caption overlay đã tắt")
+
+    def _toggle_summary_updates(self):
+        self._summary_enabled = not self._summary_enabled
+        self.live_input_window.set_summary_enabled(self._summary_enabled)
+        self.caption_window.set_summary_enabled(self._summary_enabled)
+        if self._summary_enabled:
+            self._notify("AI Summary: Resume")
+            self._kick_summary_worker()
+        else:
+            self._notify("AI Summary: Pause")
+
+    def _toggle_detached_caption_panel(self):
+        self._caption_detached = not self._caption_detached
+        self.live_input_window.set_detached_mode(self._caption_detached)
+        self.caption_window.set_summary_enabled(self._summary_enabled)
+        if self._caption_detached:
+            if self._caption_enabled:
+                self.caption_window.show()
+            self._notify("Đã tách Live Caption + AI Summary")
+        else:
+            self.caption_window.hide()
+            self._notify("Đã gắn vào panel chính")
 
     def _toggle_live_input(self):
         visible = not self.live_input_window.isVisible()
         self.act_live_input.setChecked(visible)
         if visible:
-            self.live_input_window.show()
+            self._restore_main_panel()
             self._notify("⌨️ Đã hiện ô gõ VN -> EN")
         else:
             self.live_input_window.hide()
+            self.floating_controls.show()
             self._notify("⌨️ Đã ẩn ô gõ VN -> EN")
+
+    def _restore_main_panel(self):
+        self.live_input_window.showNormal()
+        self.live_input_window.show()
+        self.live_input_window.raise_()
+        self.live_input_window.activateWindow()
+        self.floating_controls.hide()
+        self.act_live_input.setChecked(True)
+
+    def _minimize_to_floating(self):
+        self.live_input_window.hide()
+        self.floating_controls.show()
+        self.floating_controls.raise_()
+        self.act_live_input.setChecked(False)
+        self._notify("Đã thu nhỏ giao diện chính")
 
     def _mark_target_input(self):
         try:
@@ -756,10 +918,11 @@ class TeamsTranslatorApp:
         if self._status.get("capturing"):
             return
         self._start_capture()
-        self.act_capture.setText("â¹ï¸ Dá»«ng")
+        self.act_capture.setText("⏹️ Dừng")
         self._status["capturing"] = True
         self.floating_controls.sync_state(capturing=True)
-        self._notify(f"â–¶ï¸ Äang láº¯ng nghe (cháº¿ Ä‘á»™ {self._get_mode_name()})")
+        self.live_input_window.set_capture_state(capturing=True)
+        self._notify(f"▶️ Đang lắng nghe (chế độ {self._get_mode_name()})")
 
     def _auto_check(self):
         """Kiểm tra thiết bị khi khởi động."""
@@ -846,4 +1009,3 @@ class SettingsWindow:
         btn_close.clicked.connect(self.window.close)
         btn_layout.addWidget(btn_close)
         layout.addLayout(btn_layout)
-

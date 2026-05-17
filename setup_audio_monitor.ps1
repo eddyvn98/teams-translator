@@ -3,12 +3,31 @@ $ErrorActionPreference = "Stop"
 $toolDir = Join-Path $env:TEMP "soundvolumeview"
 $exe = Join-Path $toolDir "SoundVolumeView.exe"
 $zip = Join-Path $toolDir "soundvolumeview-x64.zip"
-$speaker = "Wuying ASP Audio"
 
 if (-not (Test-Path $exe)) {
     New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
     Invoke-WebRequest -Uri "https://www.nirsoft.net/utils/soundvolumeview-x64.zip" -OutFile $zip
     Expand-Archive -LiteralPath $zip -DestinationPath $toolDir -Force
+}
+
+# Resolve best real output speaker (avoid CABLE devices).
+$speakerCandidates = @(
+    "Speakers/Headphones",
+    "FxSound Speakers",
+    "Speakers"
+)
+$speaker = $null
+foreach ($candidate in $speakerCandidates) {
+    try {
+        & $exe /SetDefault $candidate all | Out-Null
+        $speaker = $candidate
+        break
+    } catch {
+        continue
+    }
+}
+if (-not $speaker) {
+    throw "Không set được default speaker. Hãy kiểm tra thiết bị output trong Sound settings."
 }
 
 # Keep default system audio on the real speaker.

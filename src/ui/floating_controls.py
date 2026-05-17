@@ -32,7 +32,8 @@ class FloatingControlWidget(QWidget):
 
         self.pause_btn = self._make_button("Resume", "primaryButton", self._on_pause_resume_clicked)
         self.caption_btn = self._make_button("Caption", "toolButton", self.app_ref._toggle_caption)
-        self.input_btn = self._make_button("Input", "toolButton", self.app_ref._toggle_live_input)
+        self.input_btn = self._make_button("Mở panel", "toolButton", self.app_ref._restore_main_panel)
+        self.input_btn.setText("Mở panel")
         self.exit_btn = self._make_button("x", "closeButton", self.app_ref._quit)
 
         for button in [self.pause_btn, self.caption_btn, self.input_btn, self.exit_btn]:

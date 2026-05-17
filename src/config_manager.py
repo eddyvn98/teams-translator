@@ -27,9 +27,15 @@ DEFAULT_CONFIG = {
     "stt_phrase_time_limit": 10,
 
     # TTS
+    "tts_backend": "qwen",  # qwen / pyttsx3
     "tts_rate": 180,
     "tts_volume": 1.0,
     "tts_voice": "english",  # english / vietnamese
+    "qwen_tts_model": "qwen3-tts-flash",
+    "qwen_tts_voice": "Nofish",
+    "qwen_tts_language_type": "English",
+    "qwen_tts_output_device": "CABLE Input",
+    "qwen_tts_output_host": "MME",
 
     # Translation direction
     # "auto" = auto-detect input language
