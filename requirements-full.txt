@@ -32,3 +32,4 @@ soundfile==0.12.1
 ## Utilities
 python-dotenv==1.0.0
 requests==2.31.0
+dashscope>=1.24.0

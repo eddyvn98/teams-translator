@@ -2,7 +2,10 @@
 Translator module — Google Translate Anh ↔ Việt
 """
 import logging
+import os
 import re
+from collections import OrderedDict
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +18,38 @@ class Translator:
         self._fallback = None  # Tự fallback nếu Google lỗi
         self.config = config_manager
         self._missing_deep_translator_logged = False
+
+        self._cache = OrderedDict()
+
+    def _config_value(self, key: str, default=None):
+        return self.config.get(key, default) if self.config else default
+
+    def _timeout(self, key: str, default: float) -> float:
+        try:
+            return max(0.5, float(self._config_value(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _normalize_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _cache_get(self, key: tuple) -> str | None:
+        value = self._cache.get(key)
+        if value is not None:
+            self._cache.move_to_end(key)
+        return value
+
+    def _cache_set(self, key: tuple, value: str) -> None:
+        if not value:
+            return
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        try:
+            max_size = int(self._config_value("translation_cache_size", 256))
+        except (TypeError, ValueError):
+            max_size = 256
+        while len(self._cache) > max(16, max_size):
+            self._cache.popitem(last=False)
 
     def _get_translator(self):
         """Lazy init translator — dùng deep-translator (tương thích httpx mới)."""
@@ -45,16 +80,81 @@ class Translator:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
             }
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            resp = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=self._timeout("translation_google_timeout", 1.8),
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 translated = "".join(seg[0] for seg in data[0] if seg[0])
                 if translated:
+                    logger.info("[MT] backend=google-gtx src=%s dest=%s", src, dest)
                     return translated
             logger.warning(f"Google Translate API trả về status {resp.status_code}")
         except Exception as e:
             logger.warning(f"Google Translate via requests lỗi: {e}")
         return None
+
+    def _qwen_translate_en_vi(self, text: str) -> str | None:
+        """Translate English -> Vietnamese via Qwen MT."""
+        if not text or not text.strip():
+            return ""
+
+        key = os.getenv("QWEN_API_KEY", "").strip() or os.getenv("DASHSCOPE_API_KEY", "").strip()
+        if not key and self.config:
+            key = str(self.config.get("qwen_api_key", "")).strip()
+        if not key:
+            return None
+
+        base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        if self.config:
+            cfg_url = str(self.config.get("qwen_base_url", "")).strip()
+            if cfg_url:
+                base_url = cfg_url.rstrip("/")
+
+        model = "qwen-mt-flash"
+        if self.config:
+            cfg_model = str(self.config.get("qwen_mt_model", "")).strip()
+            if cfg_model:
+                model = cfg_model
+        model = os.getenv("QWEN_MT_MODEL", model).strip() or "qwen-mt-flash"
+
+        payload = {
+            "model": model,
+            "stream": False,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Translate English to Vietnamese only. Return translation text only.",
+                },
+                {
+                    "role": "user",
+                    "content": text.strip(),
+                },
+            ],
+            "temperature": 0.0,
+        }
+
+        try:
+            resp = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=self._timeout("translation_qwen_timeout", 4.0),
+            )
+            if resp.status_code >= 400:
+                logger.warning("Qwen MT API status=%s body=%s", resp.status_code, resp.text[:300])
+                return None
+            obj = resp.json()
+            translated = ((obj.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "").strip()
+            if translated:
+                logger.info("[MT] backend=qwen model=%s src=en dest=vi", model)
+            return translated or None
+        except Exception as e:
+            logger.warning("Qwen MT request lỗi: %s", e)
+            return None
 
     def detect_language(self, text: str) -> str:
         """Phát hiện ngôn ngữ của text. Trả về 'vi', 'en', hoặc 'unknown'."""
@@ -79,38 +179,42 @@ class Translator:
         return "en"
 
     def translate(self, text: str, dest: str = "vi", src: str = "auto") -> str:
-        """
-        Dịch text.
-
-        Args:
-            text: Văn bản cần dịch
-            dest: Ngôn ngữ đích ('vi' hoặc 'en')
-            src: Ngôn ngữ nguồn ('auto' để tự phát hiện)
-
-        Returns:
-            str: Văn bản đã dịch
-        """
-        if not text or not text.strip():
+        """Translate text with cache, fast Google path, then Qwen fallback for EN->VI."""
+        text = self._normalize_text(text)
+        if not text:
             return ""
 
-        # Nếu text quá ngắn (1 từ), không cần dịch
-        if len(text.strip().split()) <= 1 and len(text.strip()) <= 3:
+        if len(text.split()) <= 1 and len(text) <= 3:
             return text
+
+        cache_key = (src, dest, text.lower())
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            logger.info("[MT] backend=cache src=%s dest=%s", src, dest)
+            return cached
+
+        result = self._google_translate_via_requests(text, dest=dest, src=src)
+        if result:
+            self._cache_set(cache_key, result)
+            return result
 
         translator_cls = self._get_translator()
         if translator_cls:
             try:
                 result = translator_cls(source=src, target=dest).translate(text)
-                return result if result else text
+                if result:
+                    logger.info("[MT] backend=google-deep-translator src=%s dest=%s", src, dest)
+                    self._cache_set(cache_key, result)
+                    return result
             except Exception as e:
-                logger.warning(f"Lỗi deep-translator: {e}, thử fallback requests")
+                logger.warning(f"Lỗi deep-translator: {e}, thử Qwen fallback")
 
-        # Fallback: dùng requests trực tiếp
-        result = self._google_translate_via_requests(text, dest=dest, src=src)
-        if result:
-            return result
+        if dest == "vi" and src in ("en", "auto"):
+            qwen_result = self._qwen_translate_en_vi(text)
+            if qwen_result:
+                self._cache_set(cache_key, qwen_result)
+                return qwen_result
 
-        # No translation available — return original
         return text
 
     def _fallback_translate(self, text: str, dest: str) -> str:
@@ -175,7 +279,7 @@ class Translator:
             }
 
         try:
-            translated = self.translate(text, dest=dest_lang)
+            translated = self.translate(text, dest=dest_lang, src=src_lang)
         except Exception as e:
             logger.error(f"Lỗi dịch: {e}")
             translated = text
@@ -186,3 +290,4 @@ class Translator:
             "source_lang": src_lang,
             "display_text": translated
         }
+

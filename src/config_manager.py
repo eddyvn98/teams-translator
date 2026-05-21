@@ -14,10 +14,14 @@ DEFAULT_CONFIG = {
     "source_lang": "auto",
     "target_lang_vi": "vi",
     "target_lang_en": "en",
+    "translation_google_timeout": 1.8,
+    "translation_qwen_timeout": 4.0,
+    "translation_cache_size": 256,
 
     # Qwen STT
     "qwen_base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "qwen_stt_model": "qwen3-livetranslate-flash",
+    "qwen_stt_model": "qwen3-asr-flash-realtime",
+    "qwen_mt_model": "qwen-mt-flash",
     "qwen_api_key": "",
 
     # Speech
@@ -31,9 +35,13 @@ DEFAULT_CONFIG = {
     "tts_rate": 180,
     "tts_volume": 1.0,
     "tts_voice": "english",  # english / vietnamese
-    "qwen_tts_model": "qwen3-tts-flash",
+    "qwen_tts_model": "qwen3-tts-flash-realtime",
+    "qwen_tts_rest_fallback_model": "qwen3-tts-flash",
     "qwen_tts_voice": "Nofish",
+    "qwen_tts_realtime_voice": "Ethan",
     "qwen_tts_language_type": "English",
+    "qwen_tts_realtime_url": "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
+    "qwen_tts_wait_timeout": 30,
     "qwen_tts_output_device": "CABLE Input",
     "qwen_tts_output_host": "MME",
 

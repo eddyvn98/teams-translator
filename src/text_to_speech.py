@@ -3,8 +3,10 @@
 import base64
 import logging
 import os
+import re
 import tempfile
 import threading
+import time
 from typing import Callable, Optional
 
 import requests
@@ -62,11 +64,104 @@ class TextToSpeech:
         return key
 
     def _speak_qwen(self, text: str):
+        model = str(self._config_value("qwen_tts_model", "qwen3-tts-flash-realtime")).strip()
+        if "realtime" in model:
+            try:
+                self._speak_qwen_realtime(text, model=model)
+                return
+            except Exception as exc:
+                logger.warning("Qwen realtime TTS failed, falling back to REST TTS: %s", exc)
+                fallback_model = str(self._config_value("qwen_tts_rest_fallback_model", "qwen3-tts-flash")).strip()
+                self._speak_qwen_rest(text, model=fallback_model)
+                return
+        self._speak_qwen_rest(text, model=model)
+
+    def _speak_qwen_realtime(self, text: str, model: str):
         key = self._api_key()
         if not key:
             raise RuntimeError("Missing Qwen/DashScope API key")
 
-        model = str(self._config_value("qwen_tts_model", "qwen3-tts-flash")).strip()
+        import dashscope
+        import sounddevice as sd
+        from dashscope.audio.qwen_tts_realtime import (
+            AudioFormat,
+            QwenTtsRealtime,
+            QwenTtsRealtimeCallback,
+        )
+
+        dashscope.api_key = key
+        url = str(self._config_value("qwen_tts_realtime_url", "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime")).strip()
+        voice = str(self._config_value("qwen_tts_realtime_voice", self._config_value("qwen_tts_voice", "Cherry"))).strip()
+        wait_timeout = float(self._config_value("qwen_tts_wait_timeout", 30) or 30)
+        device = self._find_output_device(sd)
+        stream = sd.RawOutputStream(
+            samplerate=24000,
+            channels=1,
+            dtype="int16",
+            device=device,
+            blocksize=0,
+        )
+
+        class RealtimeCallback(QwenTtsRealtimeCallback):
+            def __init__(self):
+                super().__init__()
+                self.complete_event = threading.Event()
+                self.error = None
+
+            def on_event(self, response):
+                try:
+                    event_type = response.get("type") if isinstance(response, dict) else None
+                    if event_type == "response.audio.delta":
+                        chunk = base64.b64decode(response.get("delta") or "")
+                        if chunk:
+                            stream.write(chunk)
+                    elif event_type in ("response.done", "session.finished"):
+                        self.complete_event.set()
+                except Exception as exc:
+                    self.error = exc
+                    self.complete_event.set()
+
+            def on_close(self, close_status_code, close_msg) -> None:
+                self.complete_event.set()
+
+        callback = RealtimeCallback()
+        qwen_tts = QwenTtsRealtime(model=model, callback=callback, url=url)
+        try:
+            logger.info("[TTS] backend=qwen-realtime model=%s voice=%s", model, voice)
+            stream.start()
+            qwen_tts.connect()
+            qwen_tts.update_session(
+                voice=voice,
+                response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,
+                mode="server_commit",
+            )
+            for chunk in self._text_chunks(text):
+                qwen_tts.append_text(chunk)
+                time.sleep(0.03)
+            qwen_tts.finish()
+            callback.complete_event.wait(timeout=wait_timeout)
+            if callback.error:
+                raise callback.error
+        finally:
+            try:
+                qwen_tts.close()
+            except Exception:
+                pass
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def _text_chunks(self, text: str) -> list[str]:
+        chunks = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
+        return chunks or [text.strip()]
+
+    def _speak_qwen_rest(self, text: str, model: str):
+        key = self._api_key()
+        if not key:
+            raise RuntimeError("Missing Qwen/DashScope API key")
+
         voice = str(self._config_value("qwen_tts_voice", "Nofish")).strip()
         language_type = str(self._config_value("qwen_tts_language_type", "English")).strip()
         url = "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"

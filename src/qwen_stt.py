@@ -39,7 +39,7 @@ class QwenSTT:
             cfg_model = str(self.config.get("qwen_stt_model", "")).strip()
             if cfg_model:
                 return cfg_model
-        return os.getenv("QWEN_STT_MODEL", "qwen3-livetranslate-flash")
+        return os.getenv("QWEN_STT_MODEL", "qwen3-asr-flash-realtime")
 
     @staticmethod
     def has_energy(audio: np.ndarray, threshold: float = 0.005) -> bool:
@@ -63,8 +63,8 @@ class QwenSTT:
     @staticmethod
     def _fallback_model(model: str, status_code: int, body_text: str) -> str | None:
         if status_code == 500 and "internal_error" in (body_text or ""):
-            if model == "qwen3-livetranslate-flash-realtime":
-                return "qwen3-livetranslate-flash"
+            if model == "qwen3-asr-flash-realtime":
+                return "qwen3-asr-flash"
         return None
 
     def transcribe_audio(self, audio: np.ndarray, sample_rate: int, language: str = "en") -> str:
@@ -82,8 +82,8 @@ class QwenSTT:
         b64 = base64.b64encode(wav_bytes).decode("ascii")
 
         model_chain = [self._model()]
-        if model_chain[0] != "qwen3-livetranslate-flash":
-            model_chain.append("qwen3-livetranslate-flash")
+        if model_chain[0] != "qwen3-asr-flash":
+            model_chain.append("qwen3-asr-flash")
 
         last_error = None
         for model in model_chain:

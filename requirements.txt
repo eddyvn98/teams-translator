@@ -35,3 +35,4 @@ python-dotenv==1.0.0
 requests==2.31.0
 google-cloud-speech>=2.26.0
 pyttsx3==2.90
+dashscope>=1.24.0

@@ -507,8 +507,11 @@ class TeamsTranslatorApp:
         clean = target_text or source_text
         if not clean:
             return
-        if self._session_transcript and self._session_transcript[-1] == clean:
-            return
+        if self._session_transcript:
+            last_clean = " ".join(self._session_transcript[-1].split()).lower()
+            current_clean = " ".join(clean.split()).lower()
+            if last_clean == current_clean or last_clean.startswith(current_clean):
+                return
         self._session_transcript.append(clean)
         self.meeting_store.append_transcript(
             source_lang=source_lang,

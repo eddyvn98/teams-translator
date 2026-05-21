@@ -450,6 +450,14 @@ class LiveInputWindow(QWidget):
             self.status_label.setText("Translation failed. Try again.")
             return
 
+        self._last_reply_payload = {
+            "english_reply": target_text,
+            "vietnamese_translation": source_text,
+            "speaking_script": target_text,
+        }
+        self.reply_en.setPlainText(target_text)
+        self.reply_vi.setPlainText(source_text)
+
         try:
             pyautogui.click(self.target_pos[0], self.target_pos[1])
             time.sleep(0.12)
@@ -472,6 +480,28 @@ class LiveInputWindow(QWidget):
         self._render_reply(payload, source="auto")
 
     def speak_reply(self):
+        source_text = self.vn_input.toPlainText().strip()
+        if source_text:
+            result = self.app_ref.translator.translate_bidirectional(source_text, direction="vi2en")
+            english_text = self._sanitize_for_target_input((result.get("target_text") or "").strip())
+            if not english_text:
+                self.status_label.setText("Translation failed. Try again.")
+                return
+            self._last_reply_payload = {
+                "english_reply": english_text,
+                "vietnamese_translation": source_text,
+                "speaking_script": english_text,
+            }
+            self.reply_en.setPlainText(english_text)
+            self.reply_vi.setPlainText(source_text)
+        elif not self._last_reply_payload:
+            english_text = self.reply_en.toPlainText().strip()
+            if english_text:
+                self._last_reply_payload = {
+                    "english_reply": english_text,
+                    "vietnamese_translation": self.reply_vi.toPlainText().strip(),
+                    "speaking_script": english_text,
+                }
         if not self._last_reply_payload:
             self.status_label.setText("No reply to speak.")
             return
