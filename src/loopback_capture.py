@@ -1,18 +1,12 @@
 """
 Loopback Audio Capture — Bắt âm thanh từ loa PC (không dùng mic)
-Dùng để bắt giọng nói của người khác trong Teams meeting
-
-Yêu cầu:
-- Windows: VB-CABLE Virtual Audio Cable hoặc Stereo Mix
-- Hoặc PyAudio loopback device
+Được tối ưu hóa cho Micro-Batching REST ASR với độ trễ cực thấp.
 """
 import logging
 import threading
 import time
 import queue
-import tempfile
-import os
-import sys
+from math import gcd
 from typing import Optional, Callable
 
 import numpy as np
@@ -25,11 +19,7 @@ logger = logging.getLogger(__name__)
 class LoopbackCapture:
     """
     Bắt âm thanh từ loa/output device (những gì người khác nói trong Teams).
-    
-    Trên Windows, cần 1 trong các điều kiện sau:
-    1. Stereo Mix enabled (Sound Control Panel → Recording → Show Disabled Devices → Enable Stereo Mix)
-    2. VB-CABLE Virtual Audio Cable cài đặt
-    3. PyAudio có WASAPI loopback support
+    Sử dụng kỹ thuật Micro-Batching REST API để vượt qua giới hạn vùng của tài khoản Quốc tế.
     """
 
     def __init__(self, config_manager=None):
@@ -42,10 +32,11 @@ class LoopbackCapture:
         self._on_result: Optional[Callable[[str], None]] = None
         self._audio_queue: queue.Queue = queue.Queue(maxsize=8)
         self._queue_drops = 0
+        self._realtime_stt = None
+        self._realtime_sample_rate = 16000
 
-        # Tự động tìm loopback device
         self._loopback_device = None
-        self._sample_rate = 44100  # Đa số devices hỗ trợ 44100
+        self._sample_rate = 44100
 
     def list_loopback_devices(self) -> list:
         """
@@ -71,7 +62,6 @@ class LoopbackCapture:
                     })
                 # WASAPI loopback devices trên Windows
                 if "speaker" in name or "headphone" in name or "realtek" in name or "output" in name:
-                    # Kiểm tra nếu có WASAPI loopback host API
                     host_api = p.get_host_api_info_by_index(info["hostApi"])
                     if "wasapi" in host_api["name"].lower():
                         devices.append({
@@ -93,10 +83,6 @@ class LoopbackCapture:
             logger.warning("Không tìm thấy loopback device nào!")
             return None
 
-        # Ưu tiên:
-        # 1) CABLE Output (khi app phát ra CABLE Input)
-        # 2) Stereo Mix
-        # 3) WASAPI loopback Speakers/FxSound
         for d in devices:
             name_lower = d["name"].lower()
             if "cable output (vb-audio virtual" in name_lower and d.get("channels", 0) >= 1:
@@ -105,16 +91,13 @@ class LoopbackCapture:
 
         for d in devices:
             if "stereo mix" in d["name"].lower():
-                # Xác thực bằng sounddevice
                 try:
                     import sounddevice as sd
-                    import numpy as np
                     candidates = []
                     for i in range(sd.query_devices().__len__()):
                         info = sd.query_devices(i)
                         if "stereo mix" in info["name"].lower() and info["max_input_channels"] >= 2:
                             candidates.append(i)
-                    # Test từng candidate để tìm cái có tín hiệu
                     for idx in candidates:
                         try:
                             sr = int(min(44100, info['default_samplerate']))
@@ -136,12 +119,62 @@ class LoopbackCapture:
                 logger.info(f"Tìm thấy WASAPI loopback: {d['name']} (index={d['index']})")
                 return d["index"]
 
-        # Fallback: device đầu tiên
         logger.info(f"Dùng loopback device: {devices[0]['name']} (index={devices[0]['index']})")
         return devices[0]["index"]
 
     def set_on_result(self, callback: Callable[[str], None]):
         self._on_result = callback
+
+    def _emit_result(self, text: str, is_final: bool = True):
+        if not text or not text.strip() or not self._on_result:
+            return
+        try:
+            self._on_result(text.strip(), is_final)
+        except TypeError:
+            self._on_result(text.strip())
+
+    @staticmethod
+    def _audio_to_pcm16_bytes(audio: np.ndarray, source_rate: int, target_rate: int = 16000) -> bytes:
+        audio = np.asarray(audio, dtype=np.float32).flatten()
+        if audio.size == 0:
+            return b""
+
+        source_rate = int(source_rate)
+        target_rate = int(target_rate)
+        if source_rate != target_rate:
+            try:
+                from scipy.signal import resample_poly
+
+                divisor = gcd(source_rate, target_rate)
+                audio = resample_poly(audio, target_rate // divisor, source_rate // divisor).astype(np.float32)
+            except Exception:
+                target_len = max(1, int(round(audio.size * target_rate / source_rate)))
+                old_x = np.linspace(0.0, 1.0, num=audio.size, endpoint=False)
+                new_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+                audio = np.interp(new_x, old_x, audio).astype(np.float32)
+
+        pcm = np.clip(audio, -1.0, 1.0)
+        return (pcm * 32767.0).astype(np.int16).tobytes()
+
+    def _start_realtime_stt(self) -> bool:
+        mode = str(self.config.get("loopback_stt_mode", "realtime") if self.config else "realtime").lower()
+        if mode == "rest":
+            return False
+
+        try:
+            from src.qwen_realtime_stt import QwenRealtimeSTT
+
+            self._realtime_sample_rate = int(
+                self.config.get("loopback_realtime_sample_rate", 16000) if self.config else 16000
+            )
+            self._realtime_stt = QwenRealtimeSTT(self.config, on_text_received=self._emit_result)
+            self._realtime_stt.start(sample_rate=self._realtime_sample_rate)
+            logger.info("Loopback realtime STT enabled (sample_rate=%s)", self._realtime_sample_rate)
+            return True
+        except Exception as e:
+            self._realtime_stt = None
+            logger.warning("Loopback realtime STT unavailable, falling back to REST batches: %s", e)
+            return False
 
     def start_capture(self):
         """Bắt đầu capture âm thanh từ loa."""
@@ -150,56 +183,138 @@ class LoopbackCapture:
 
         device_index = self.find_best_loopback_device()
         if device_index is None:
-            logger.error(
-                "❌ KHÔNG tìm thấy loopback device!\n"
-                "Cài VB-CABLE: https://vb-audio.com/Cable/\n"
-                "Hoặc bật Stereo Mix: Sound Panel → Recording → Show Disabled → Enable Stereo Mix"
-            )
+            logger.error("❌ KHÔNG tìm thấy loopback device!")
             return
 
         self._capturing = True
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._capture_loop, args=(device_index,), daemon=True, name="Loopback-Capture")
-        self._stt_threads = [
-            threading.Thread(target=self._stt_loop, daemon=True, name=f"Loopback-STT-{i+1}")
-            for i in range(2)
-        ]
+        use_realtime = self._start_realtime_stt()
+        self._thread = threading.Thread(
+            target=self._capture_loop,
+            args=(device_index,),
+            daemon=True,
+            name="Loopback-Capture"
+        )
+        if use_realtime:
+            self._stt_threads = []
+        else:
+            self._stt_threads = [
+                threading.Thread(target=self._stt_loop, daemon=True, name=f"Loopback-STT-{i+1}")
+                for i in range(2)
+            ]
         self._thread.start()
         for t in self._stt_threads:
             t.start()
         logger.info(f"Đã bắt đầu capture loopback (device={device_index})")
 
     def stop_capture(self):
+        if not self._capturing:
+            return
         self._capturing = False
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+            self._thread = None
         for t in self._stt_threads:
             if t.is_alive():
                 t.join(timeout=3)
+        self._stt_threads = []
+        if self._realtime_stt:
+            try:
+                self._realtime_stt.stop()
+            except Exception as e:
+                logger.warning("Loopback realtime STT stop error: %s", e)
+            self._realtime_stt = None
         logger.info("Đã dừng capture loopback")
 
     @property
     def is_capturing(self) -> bool:
         return self._capturing
 
+    def _stt_has_energy(self, audio: np.ndarray, threshold: float = 0.002) -> bool:
+        if audio is None or len(audio) == 0:
+            return False
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float32))))
+        return rms >= threshold
+
     def _capture_loop(self, device_index: int):
+        if self._realtime_stt:
+            self._capture_realtime_loop(device_index)
+        else:
+            self._capture_rest_loop(device_index)
+
+    def _capture_realtime_loop(self, device_index: int):
+        """Stream loopback frames to realtime ASR using continuous sounddevice InputStream."""
+        import sounddevice as sd
+
+        device_info = sd.query_devices(device_index)
+        sample_rate = int(device_info.get("default_samplerate") or self._sample_rate)
+        is_stereo = "stereo mix" in device_info["name"].lower()
+        actual_channels = 2 if is_stereo else 1
+
+        logger.info(
+            "Bắt đầu loopback realtime stream InputStream (input=%sHz, asr=%sHz)...",
+            sample_rate,
+            self._realtime_sample_rate,
+        )
+
+        audio_q = queue.Queue()
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                logger.warning(f"InputStream status: {status}")
+            audio_q.put(indata.copy())
+
+        # Target ~100ms blocks
+        block_size = int(sample_rate * 0.1)
+
+        try:
+            stream = sd.InputStream(
+                device=device_index,
+                channels=actual_channels,
+                samplerate=sample_rate,
+                dtype="float32",
+                blocksize=block_size,
+                callback=callback
+            )
+            with stream:
+                while not self._stop_event.is_set() and self._capturing and self._realtime_stt:
+                    try:
+                        recording = audio_q.get(timeout=0.1)
+                        if is_stereo:
+                            recording = recording.mean(axis=1, keepdims=True)
+                        
+                        pcm = self._audio_to_pcm16_bytes(
+                            recording.flatten(),
+                            source_rate=sample_rate,
+                            target_rate=self._realtime_sample_rate,
+                        )
+                        if pcm and self._realtime_stt:
+                            self._realtime_stt.send_audio(pcm)
+                    except queue.Empty:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Lỗi gửi audio realtime: {e}")
+        except Exception as e:
+            logger.error(f"Lỗi khởi động InputStream: {e}")
+
+    def _capture_rest_loop(self, device_index: int):
         """
-        Vòng lặp capture: ghi âm từng chunk, Google STT.
+        Vòng lặp capture: ghi âm từng chunk 1.2 giây và đưa vào hàng đợi xử lý.
         """
         import sounddevice as sd
-        import time
+        
         sample_rate = self._sample_rate
-        chunk_duration = 3.0
-        overlap_duration = 0.8
+        chunk_duration = 1.2
+        overlap_duration = 0.4
         chunk_samples = int(sample_rate * chunk_duration)
         overlap_samples = int(sample_rate * overlap_duration)
         prev_tail = np.array([], dtype=np.float32)
         silence_skips = 0
 
-        logger.info("Bat dau loopback stream (Qwen STT, chunk=3.0s, overlap=0.8s)...")
+        logger.info("Bắt đầu loopback capture (Qwen REST STT, chunk=1.2s, overlap=0.4s)...")
 
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and self._capturing:
             try:
                 device_info = sd.query_devices(device_index)
                 is_stereo = "stereo mix" in device_info['name'].lower()
@@ -227,16 +342,11 @@ class LoopbackCapture:
                     audio_send = audio_mono
 
                 # VAD
-                if not self._stt.has_energy(audio_send, threshold=0.003):
+                if not self._stt_has_energy(audio_send, threshold=0.002):
                     silence_skips += 1
-                    if silence_skips % 10 == 0:
-                        peak = float(np.max(np.abs(audio_send))) if audio_send.size else 0.0
-                        logger.warning(
-                            f"Loopback no-audio chunks={silence_skips}, peak={peak:.5f}. "
-                            "Kiem tra output routing (CABLE Input <-> CABLE Output hoac Speakers)."
-                        )
                     prev_tail = audio_mono[-overlap_samples:] if audio_mono.size > overlap_samples else audio_mono
                     continue
+                
                 silence_skips = 0
                 item = (audio_send.copy(), sample_rate, "en")
                 try:
@@ -251,8 +361,6 @@ class LoopbackCapture:
                         self._audio_queue.put_nowait(item)
                     except Exception:
                         pass
-                    if self._queue_drops % 10 == 0:
-                        logger.warning(f"Audio queue drop count={self._queue_drops}")
 
                 prev_tail = audio_mono[-overlap_samples:] if audio_mono.size > overlap_samples else audio_mono
 
@@ -261,7 +369,7 @@ class LoopbackCapture:
                 time.sleep(1)
 
     def _stt_loop(self):
-        """Worker gửi STT tách rời khỏi capture để tránh mất audio khi mạng chậm."""
+        """Worker gửi REST ASR tách rời khỏi capture để tránh mất audio khi mạng chậm."""
         while not self._stop_event.is_set():
             try:
                 audio_send, sample_rate, language = self._audio_queue.get(timeout=0.2)
@@ -273,28 +381,19 @@ class LoopbackCapture:
                 dt = time.time() - t0
                 if text and text.strip():
                     logger.info(f"Loopback STT ({dt:.2f}s): '{text}'")
-                    if self._on_result:
-                        self._on_result(text)
+                    self._emit_result(text, is_final=True)
             except Exception as e:
                 logger.warning(f"Qwen STT request error: {e}")
 
     def capture_once(self, duration: int = 5) -> Optional[str]:
-        """Capture loopback một lần."""
-        device_index = self.find_best_loopback_device()
-        if device_index is None:
-            return None
-
+        """Ghi âm một lần (chế độ batch) để tương thích ngược."""
+        import sounddevice as sd
         try:
-            import sounddevice as sd
-
-            device_info = sd.query_devices(device_index)
-            sample_rate = int(device_info.get('default_samplerate') or self._sample_rate or 44100)
-            channels = min(1, int(device_info.get('max_input_channels', 0)))
-            if channels == 0:
-                logger.warning(f"Device {device_index} không có input channel")
+            device_index = self.find_best_loopback_device()
+            if device_index is None:
                 return None
-
-            # Stereo Mix cần 2 channels, CABLE cần 1
+            device_info = sd.query_devices(device_index)
+            sample_rate = int(device_info.get('default_samplerate') or 44100)
             actual_channels = 2 if "stereo mix" in device_info['name'].lower() else 1
 
             recording = sd.rec(
@@ -306,12 +405,9 @@ class LoopbackCapture:
             )
             sd.wait()
 
-            # Nếu stereo, convert sang mono
             if actual_channels == 2:
                 recording = recording.mean(axis=1, keepdims=True)
 
-            if actual_channels == 2:
-                recording = recording.mean(axis=1, keepdims=True)
             text = self._stt.transcribe_audio(recording.flatten(), sample_rate=sample_rate, language="en")
             return text
         except Exception as e:
@@ -336,4 +432,3 @@ class LoopbackCapture:
         except Exception as e:
             lines.append(f"  Lỗi: {e}")
         return "\n".join(lines)
-

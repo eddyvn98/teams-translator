@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import datetime
+import subprocess
 from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QInputDialog
@@ -70,7 +71,7 @@ class TeamsTranslatorApp:
         self._capture_mode = self.MODE_LOOPBACK  # Mặc định: loopback
         self._caption_enabled = True
         self._caption_detached = False
-        self._summary_enabled = True
+        self._summary_enabled = False
 
         # Connect callbacks
         self.loopback.set_on_result(self._on_loopback_result)
@@ -91,11 +92,15 @@ class TeamsTranslatorApp:
         self.caption_window.hide()
         self.live_input_window.set_capture_state(capturing=False)
         self.live_input_window.set_caption_enabled(enabled=True)
-        self.live_input_window.set_summary_enabled(enabled=True)
+        self.live_input_window.set_summary_enabled(enabled=False)
+        self.caption_window.set_summary_enabled(enabled=False)
         self.live_input_window.set_detached_mode(detached=False)
 
         self._ensure_icon()
         self._last_loopback_display = ""
+        self._last_loopback_partial_text = ""
+        self._last_loopback_partial_at = 0.0
+        self._last_partial_translate_at = 0.0
         self._session_transcript = []
         self._session_started_at = time.time()
         self._last_summary_minute = -1
@@ -110,6 +115,7 @@ class TeamsTranslatorApp:
             created_ts=self._session_started_at,
             display_name=self._session_display_name(self._meeting_id),
         )
+        self._audio_setup_done = False
 
 
     def _set_caption_visible(self, visible: bool):
@@ -428,32 +434,95 @@ class TeamsTranslatorApp:
 
     # ============ CALLBACKS ============
 
-    def _on_loopback_result(self, text: str):
+    def _on_loopback_result(self, text: str, is_final: bool = True):
         """
-        ⭐ Luồng CHÍNH: Loopback bắt được giọng người khác.
-        Người khác nói tiếng Anh → App bắt âm thanh số → STT → Dịch → Caption Việt
+        Luồng CHÍNH: Loopback bắt được giọng người khác.
+        Người khác nói tiếng Anh -> App bắt âm thanh số -> STT -> Dịch -> Caption Việt
         """
         if not text or not text.strip():
             return
-        logger.info(f"🔊 Loopback: '{text}'")
-        # Qwen LiveTranslate đã trả về tiếng Việt, tránh dịch lần 2 gây câu cụt.
-        src_lang = self.translator.detect_language(text)
-        if src_lang == "vi":
+        text = text.strip()
+        text = text[0].upper() + text[1:] if text else ""
+        
+        # 1. Nếu là partial ASR (đang nói)
+        if not is_final:
+            if not self._should_show_loopback_partial(text):
+                return
+            logger.info(f"Loopback Partial: '{text}'")
+            
+            # Immediately show English caption to ensure sub-second responsiveness
             result = {
                 "source_text": text,
-                "target_text": text,
-                "source_lang": "vi",
+                "target_text": "",
+                "source_lang": "en",
                 "display_text": text,
+                "is_final": False
             }
-        else:
-            result = self.translator.translate_bidirectional(text, direction="en2vi")
-        if result.get("display_text"):
-            result["display_text"] = self._stabilize_loopback_text(result["display_text"])
-            result["target_text"] = result["display_text"]
-        if self._status["caption"] and result.get("display_text"):
-            self.caption_window.show_caption(result)
-            self.live_input_window.update_live_caption(result)
-            self._append_session_text(result)
+            if self._status["caption"] and result.get("display_text"):
+                self.caption_window.show_caption(result)
+                self.live_input_window.update_live_caption(result)
+                
+            # Translate partial text asynchronously, throttled to once every 800ms
+            now = time.time()
+            if now - getattr(self, "_last_partial_translate_at", 0.0) >= 0.8:
+                self._last_partial_translate_at = now
+                import threading
+                threading.Thread(
+                    target=self._async_translate_and_update_gui,
+                    args=(text, "en", "vi", "loopback", False),
+                    daemon=True
+                ).start()
+            return
+
+        # 2. Nếu là final ASR (đã nói xong câu)
+        logger.info(f"Loopback Final: '{text}'")
+        if len(text.strip()) < 2:
+            return
+        self._last_loopback_display = ""
+        self._last_loopback_partial_text = ""
+        self._last_loopback_partial_at = 0.0
+        
+        # Dispatch the finalized English caption immediately to the GUI so it prints instantly without waiting for translation
+        immediate_result = {
+            "source_text": text,
+            "target_text": "",
+            "source_lang": "en",
+            "display_text": text,
+            "is_final": True,
+            "skip_session_append": True
+        }
+        self._dispatch_to_gui(immediate_result, "loopback")
+
+        import threading
+        threading.Thread(
+            target=self._async_translate_and_update_gui,
+            args=(text, "en", "vi", "loopback"),
+            daemon=True
+        ).start()
+
+    def _should_show_loopback_partial(self, text: str) -> bool:
+        current = " ".join((text or "").split())
+        if not current:
+            return False
+
+        min_chars = int(self.config.get("loopback_partial_translate_min_chars", 8) if self.config else 8)
+        if len(current) < min_chars:
+            return False
+
+        previous = getattr(self, "_last_loopback_partial_text", "")
+        now = time.time()
+        if current == previous:
+            return False
+
+        interval_ms = int(self.config.get("loopback_partial_translate_interval_ms", 350) if self.config else 350)
+        elapsed_ms = (now - float(getattr(self, "_last_loopback_partial_at", 0.0) or 0.0)) * 1000.0
+        grew_substantially = previous and current.startswith(previous) and len(current) >= len(previous) + 12
+        if previous and elapsed_ms < interval_ms and not grew_substantially:
+            return False
+
+        self._last_loopback_partial_text = current
+        self._last_loopback_partial_at = now
+        return True
 
     def _stabilize_loopback_text(self, text: str) -> str:
         """Giảm giật/lặp caption khi dùng micro-batch có overlap."""
@@ -480,12 +549,13 @@ class TeamsTranslatorApp:
         """
         if not text or not text.strip():
             return
-        logger.info(f"🎤 Mic: '{text}'")
-        result = self.translator.translate_bidirectional(text, direction="auto")
-        if self._status["caption"]:
-            self.caption_window.show_caption(result)
-            self.live_input_window.update_live_caption(result)
-            self._append_session_text(result)
+        logger.info(f"Mic: '{text}'")
+        import threading
+        threading.Thread(
+            target=self._async_translate_and_update_gui,
+            args=(text, "auto", "vi", "stt"),
+            daemon=True
+        ).start()
 
     def _on_teams_caption(self, text: str):
         """
@@ -493,12 +563,62 @@ class TeamsTranslatorApp:
         """
         if not text or not text.strip() or len(text) < 10:
             return
-        logger.info(f"📖 OCR: '{text[:80]}...'")
-        result = self.translator.translate_bidirectional(text, direction="en2vi")
-        if self._status["caption"]:
+        logger.info(f"OCR: '{text[:80]}...'")
+        import threading
+        threading.Thread(
+            target=self._async_translate_and_update_gui,
+            args=(text, "en", "vi", "ocr"),
+            daemon=True
+        ).start()
+
+    def _async_translate_and_update_gui(self, text: str, src_lang: str, dest_lang: str, mode: str, is_final: bool = True):
+        try:
+            # Auto-detect language if needed
+            if src_lang == "auto":
+                src_lang = self.translator.detect_language(text)
+                dest_lang = "en" if src_lang == "vi" else "vi"
+
+            # If same language, no translation needed
+            if src_lang == dest_lang:
+                result = {
+                    "source_text": text,
+                    "target_text": text,
+                    "source_lang": src_lang,
+                    "display_text": text,
+                    "is_final": is_final
+                }
+                if not is_final:
+                    result["skip_session_append"] = True
+                self._dispatch_to_gui(result, mode)
+                return
+
+            # Real-time WebSocket ASR does not have overlapping chunks, so no stabilizer is needed
+            stable_text = text
+
+            # Translate using Google Translate / cache (avoid Qwen dependency)
+            translated_text = self.translator.translate(stable_text, dest=dest_lang, src=src_lang)
+            final_text = translated_text if translated_text else stable_text
+
+            final_result = {
+                "source_text": stable_text,
+                "target_text": final_text,
+                "source_lang": src_lang,
+                "display_text": final_text,
+                "is_final": is_final
+            }
+            if not is_final:
+                final_result["skip_session_append"] = True
+            self._dispatch_to_gui(final_result, mode)
+
+        except Exception as e:
+            logger.error(f"Error in async translation: {e}")
+
+    def _dispatch_to_gui(self, result: dict, mode: str):
+        if self._status["caption"] and result.get("display_text") is not None:
             self.caption_window.show_caption(result)
             self.live_input_window.update_live_caption(result)
-            self._append_session_text(result)
+            if result.get("is_final", True) and not result.get("skip_session_append", False):
+                self._append_session_text(result)
 
     def _append_session_text(self, result: dict):
         source_text = (result.get("source_text") or "").strip()
@@ -889,6 +1009,33 @@ class TeamsTranslatorApp:
 
         self._stop_current_capture()
         try:
+            project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script_path = os.path.join(project_dir, "setup_audio_monitor.ps1")
+            if os.path.exists(script_path):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
+
+                restore_process = subprocess.run(
+                    ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, "-Restore"],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    startupinfo=startupinfo,
+                    check=False,
+                )
+                if restore_process.stdout:
+                    logger.info(restore_process.stdout.strip())
+                if restore_process.stderr:
+                    logger.warning(restore_process.stderr.strip())
+                if restore_process.returncode != 0:
+                    logger.warning(
+                        "Audio restore script exited with code %s",
+                        restore_process.returncode,
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to restore audio setup on quit: {e}")
+        try:
             self.tray.hide()
         except Exception:
             pass
@@ -907,6 +1054,8 @@ class TeamsTranslatorApp:
 
     def start(self):
         """Khởi động app."""
+        # Tự động cấu hình âm thanh khi start
+        threading.Thread(target=self._run_audio_setup, daemon=True).start()
         # Tự động kiểm tra loopback device khi start
         threading.Thread(target=self._auto_check, daemon=True).start()
         self._summary_timer = QTimer()
@@ -918,6 +1067,10 @@ class TeamsTranslatorApp:
 
     def _auto_start_capture(self):
         """Start loopback capture after startup so the app begins listening immediately."""
+        if not self._audio_setup_done:
+            logger.info("Waiting for audio setup to complete before starting capture...")
+            QTimer.singleShot(1000, self._auto_start_capture)
+            return
         if self._status.get("capturing"):
             return
         self._start_capture()
@@ -926,6 +1079,180 @@ class TeamsTranslatorApp:
         self.floating_controls.sync_state(capturing=True)
         self.live_input_window.set_capture_state(capturing=True)
         self._notify(f"▶️ Đang lắng nghe (chế độ {self._get_mode_name()})")
+
+    def _run_audio_setup(self):
+        """Tự động cấu hình âm thanh bằng cách chạy setup_audio_monitor.ps1 ngầm."""
+        logger.info("Executing automatic audio configuration...")
+        try:
+            project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script_path = os.path.join(project_dir, "setup_audio_monitor.ps1")
+            
+            if os.path.exists(script_path):
+                # Thiết lập ẩn cửa sổ CMD/PowerShell trên Windows
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
+                
+                process = subprocess.run(
+                    ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path],
+                    cwd=project_dir,
+                    capture_output=True,
+                    text=True,
+                    startupinfo=startupinfo,
+                    check=True
+                )
+                logger.info("Audio configuration successfully applied.")
+                logger.info(process.stdout)
+                self._audio_setup_done = True
+                
+                # Show tray message indicating success
+                self.tray.showMessage(
+                    "Cấu hình âm thanh",
+                    "✅ Đã tự động cấu hình thiết bị âm thanh và loa thành công!",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
+            else:
+                logger.warning(f"Audio setup script not found at: {script_path}")
+                self._audio_setup_done = True
+        except Exception as e:
+            logger.error(f"Failed to auto-configure audio: {e}")
+            if hasattr(e, 'stderr') and e.stderr:
+                logger.error(f"PowerShell error: {e.stderr}")
+            self._audio_setup_done = True
+            self.tray.showMessage(
+                "Cấu hình âm thanh",
+                "⚠️ Lỗi cấu hình âm thanh tự động. Vui lòng kiểm tra log.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000
+            )
+
+    def manual_setup_audio(self):
+        """Manually trigger VB-Cable and audio monitor setup in a background thread."""
+        logger.info("Manual audio setup triggered by user.")
+        self.tray.showMessage(
+            "Cấu hình âm thanh",
+            "⏳ Đang thiết lập nghe loa và dịch...",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000
+        )
+        if hasattr(self, "live_input_window") and self.live_input_window:
+            self.live_input_window.status_label.setText("Đang cấu hình thiết bị âm thanh...")
+        
+        def run():
+            try:
+                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                script_path = os.path.join(project_dir, "setup_audio_monitor.ps1")
+                
+                if os.path.exists(script_path):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                    
+                    process = subprocess.run(
+                        ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        startupinfo=startupinfo,
+                        check=True
+                    )
+                    logger.info("Manual audio configuration successfully applied.")
+                    self._audio_setup_done = True
+                    QTimer.singleShot(0, lambda: self._on_audio_setup_finished(success=True, error_msg=""))
+                else:
+                    QTimer.singleShot(0, lambda: self._on_audio_setup_finished(success=False, error_msg="Không tìm thấy file setup_audio_monitor.ps1"))
+            except Exception as e:
+                logger.error(f"Failed to manually configure audio: {e}")
+                err_text = str(e)
+                if hasattr(e, 'stderr') and e.stderr:
+                    err_text = str(e.stderr)
+                QTimer.singleShot(0, lambda: self._on_audio_setup_finished(success=False, error_msg=err_text))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_audio_setup_finished(self, success: bool, error_msg: str):
+        if success:
+            self.tray.showMessage(
+                "Cấu hình âm thanh",
+                "✅ Đã cấu hình nghe loa & dịch thành công!",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+            if hasattr(self, "live_input_window") and self.live_input_window:
+                self.live_input_window.status_label.setText("Cấu hình loa & dịch thành công.")
+        else:
+            self.tray.showMessage(
+                "Cấu hình âm thanh",
+                f"❌ Lỗi cấu hình: {error_msg[:100]}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000
+            )
+            if hasattr(self, "live_input_window") and self.live_input_window:
+                self.live_input_window.status_label.setText(f"Lỗi cấu hình âm thanh: {error_msg[:60]}")
+
+    def manual_restore_audio(self):
+        """Manually restore Windows audio playback defaults and stop monitor."""
+        logger.info("Manual audio restore triggered by user.")
+        self.tray.showMessage(
+            "Cấu hình âm thanh",
+            "⏳ Đang khôi phục loa về bình thường...",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000
+        )
+        if hasattr(self, "live_input_window") and self.live_input_window:
+            self.live_input_window.status_label.setText("Đang khôi phục loa mặc định...")
+
+        def run():
+            try:
+                project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                script_path = os.path.join(project_dir, "setup_audio_monitor.ps1")
+                
+                if os.path.exists(script_path):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0  # SW_HIDE
+                    
+                    process = subprocess.run(
+                        ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, "-Restore"],
+                        cwd=project_dir,
+                        capture_output=True,
+                        text=True,
+                        startupinfo=startupinfo,
+                        check=True
+                    )
+                    logger.info("Manual audio restore successfully applied.")
+                    QTimer.singleShot(0, lambda: self._on_audio_restore_finished(success=True, error_msg=""))
+                else:
+                    QTimer.singleShot(0, lambda: self._on_audio_restore_finished(success=False, error_msg="Không tìm thấy file setup_audio_monitor.ps1"))
+            except Exception as e:
+                logger.error(f"Failed to manually restore audio: {e}")
+                err_text = str(e)
+                if hasattr(e, 'stderr') and e.stderr:
+                    err_text = str(e.stderr)
+                QTimer.singleShot(0, lambda: self._on_audio_restore_finished(success=False, error_msg=err_text))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_audio_restore_finished(self, success: bool, error_msg: str):
+        if success:
+            self.tray.showMessage(
+                "Cấu hình âm thanh",
+                "✅ Đã khôi phục loa bình thường thành công!",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+            if hasattr(self, "live_input_window") and self.live_input_window:
+                self.live_input_window.status_label.setText("Khôi phục loa thành công.")
+        else:
+            self.tray.showMessage(
+                "Cấu hình âm thanh",
+                f"❌ Lỗi khôi phục: {error_msg[:100]}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                4000
+            )
+            if hasattr(self, "live_input_window") and self.live_input_window:
+                self.live_input_window.status_label.setText(f"Lỗi khôi phục: {error_msg[:60]}")
 
     def _auto_check(self):
         """Kiểm tra thiết bị khi khởi động."""

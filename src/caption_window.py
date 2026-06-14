@@ -30,6 +30,9 @@ class CaptionWindow(QWidget):
         super().__init__(parent)
         self.config = config_manager
         self.app_ref = app_ref
+        self._display_mode = "both"
+        if self.config:
+            self._display_mode = self.config.get("display_mode", "both")
         self._history = []
         self._current_text = {"source": "", "translated": "", "lang": ""}
         self._history_dir = Path.home() / ".teams-translator" / "history"
@@ -38,10 +41,11 @@ class CaptionWindow(QWidget):
         self._history_file = self._history_dir / f"session-{self._session_id}.log"
         self._summary_file = self._history_dir / f"session-{self._session_id}-summary.txt"
         self._summary_collapsed = False
-        self._summary_enabled = True
+        self._summary_enabled = False
         self._dragging = False
         self._drag_pos = QPoint()
         self._idle_seconds = 0
+        self._current_interim = None
 
         self.setWindowTitle("Teams Translator - Caption")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -90,6 +94,14 @@ class CaptionWindow(QWidget):
         self.mode_label.setObjectName("modePill")
         header.addWidget(self.mode_label)
 
+        # Mode button to cycle: Both / English only / Vietnamese only
+        self.display_mode_btn = QPushButton()
+        self.display_mode_btn.setObjectName("smallButton")
+        self.display_mode_btn.clicked.connect(self._cycle_display_mode)
+        labels = {"both": "Mode: Both", "en_only": "Mode: EN", "vi_only": "Mode: VI"}
+        self.display_mode_btn.setText(labels.get(self._display_mode, "Mode: Both"))
+        header.addWidget(self.display_mode_btn)
+
         self.summary_toggle = QPushButton("Summary")
         self.summary_toggle.setObjectName("smallButton")
         self.summary_toggle.clicked.connect(self._toggle_summary)
@@ -118,11 +130,33 @@ class CaptionWindow(QWidget):
         header.addWidget(self.close_btn)
         card_layout.addLayout(header)
 
+        # Live Active Caption Box (Interim Updates)
+        self.live_caption_box = QFrame()
+        self.live_caption_box.setObjectName("liveCaptionBox")
+        live_layout = QVBoxLayout(self.live_caption_box)
+        live_layout.setContentsMargins(10, 8, 10, 8)
+        live_layout.setSpacing(4)
+        
+        self.live_en_label = QLabel()
+        self.live_en_label.setObjectName("liveEnLabel")
+        self.live_en_label.setWordWrap(True)
+        self.live_en_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        
+        self.live_vi_label = QLabel()
+        self.live_vi_label.setObjectName("liveViLabel")
+        self.live_vi_label.setWordWrap(True)
+        self.live_vi_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        
+        live_layout.addWidget(self.live_en_label)
+        live_layout.addWidget(self.live_vi_label)
+        self.live_caption_box.setVisible(False)
+        # card_layout.addWidget(self.live_caption_box, 2) # Hidden to unify into history_view
+
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
         self.history_view.setObjectName("historyView")
-        self.history_view.setPlaceholderText("Transcript will appear here...")
-        card_layout.addWidget(self.history_view, 5)
+        self.history_view.setPlaceholderText("Transcript history will appear here...")
+        card_layout.addWidget(self.history_view, 4)
 
         self.summary_view = QTextEdit()
         self.summary_view.setReadOnly(True)
@@ -153,7 +187,7 @@ class CaptionWindow(QWidget):
         self.setStyleSheet(
             """
             #captionCard {
-                background: rgba(14, 18, 27, 232);
+                background: rgba(10, 14, 22, 252);
                 border: 1px solid rgba(123, 164, 255, 120);
                 border-radius: 14px;
             }
@@ -173,9 +207,9 @@ class CaptionWindow(QWidget):
                 color: #bbf7d0;
                 background: rgba(34, 197, 94, 35);
                 border: 1px solid rgba(34, 197, 94, 95);
-                border-radius: 8px;
-                padding: 4px 8px;
-                font: 700 10px "Segoe UI";
+                border-radius: 6px;
+                padding: 3px 6px;
+                font: 700 9px "Segoe UI";
             }
             #historyView, #summaryView {
                 color: #f8fafc;
@@ -189,13 +223,21 @@ class CaptionWindow(QWidget):
                 color: #dbeafe;
                 background: rgba(30, 41, 59, 185);
             }
-            #smallButton, #iconButton, #closeButton {
+            #smallButton {
                 color: #e2e8f0;
                 background: rgba(51, 65, 85, 180);
                 border: 1px solid rgba(148, 163, 184, 90);
-                border-radius: 8px;
-                padding: 5px 9px;
-                font: 600 11px "Segoe UI";
+                border-radius: 6px;
+                padding: 3px 6px;
+                font: 600 10px "Segoe UI";
+            }
+            #iconButton, #closeButton {
+                color: #e2e8f0;
+                background: rgba(51, 65, 85, 180);
+                border: 1px solid rgba(148, 163, 184, 90);
+                border-radius: 6px;
+                padding: 3px 7px;
+                font: 600 10px "Segoe UI";
             }
             #smallButton:hover, #iconButton:hover {
                 background: rgba(71, 85, 105, 220);
@@ -214,6 +256,23 @@ class CaptionWindow(QWidget):
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
+            }
+            #liveCaptionBox {
+                background: rgba(30, 41, 59, 140);
+                border: 1px dashed rgba(123, 164, 255, 90);
+                border-radius: 10px;
+                padding: 6px;
+                margin-top: 4px;
+                margin-bottom: 4px;
+            }
+            #liveEnLabel {
+                color: rgba(203, 213, 225, 180);
+                font-style: italic;
+            }
+            #liveViLabel {
+                color: #f8fafc;
+                font-weight: bold;
+                font-style: italic;
             }
             """
         )
@@ -256,11 +315,7 @@ class CaptionWindow(QWidget):
         self._save_geometry()
 
     def show_caption(self, data: dict):
-        self._idle_seconds = 0
         self.update_signal.emit(data)
-        self._history.append(data)
-        if len(self._history) > 500:
-            self._history.pop(0)
 
     def set_summary(self, text: str):
         self.summary_signal.emit(text or "")
@@ -298,29 +353,156 @@ class CaptionWindow(QWidget):
             except Exception as e:
                 logger.warning(f"Khong the ghi summary: {e}")
 
+    def _format_caption_html(self, source_text: str, target_text: str, now: str, font_size: int, en_font_size: int) -> str:
+        if not source_text and not target_text:
+            return ""
+        # If identical, render 1 line
+        if source_text and target_text and source_text.lower() == target_text.lower():
+            text_to_show = source_text if self._display_mode == "en_only" else target_text
+            return f"<span style='color: #f8fafc;'>[{now}] {text_to_show}</span>"
+        # Render based on display_mode
+        if self._display_mode == "vi_only":
+            if target_text:
+                return f"<span style='color: #f8fafc;'>[{now}] VI : {target_text}</span>"
+            elif source_text:
+                return f"<span style='color: #64748b; font-size: {en_font_size}pt; font-style: italic;'>[{now}] (Dịch...) {source_text}</span>"
+            return ""
+        elif self._display_mode == "en_only":
+            if source_text:
+                return f"<span style='color: #f8fafc;'>[{now}] SRC: {source_text}</span>"
+            return ""
+        else: # both
+            parts = []
+            if source_text:
+                parts.append(f"<span style='color: #94a3b8; font-size: {en_font_size}pt;'>[{now}] SRC: {source_text}</span>")
+            if target_text:
+                parts.append(f"<span style='color: #f8fafc;'>[{now}] VI : {target_text}</span>")
+            else:
+                parts.append(f"<span style='color: #64748b; font-size: {en_font_size}pt; font-style: italic;'>[Dịch...]</span>")
+            return "<br>".join(parts)
+
+    def _format_interim_html(self, source_text: str, target_text: str, font_size: int, en_font_size: int) -> str:
+        if not source_text and not target_text:
+            return ""
+        if self._display_mode == "vi_only":
+            if target_text:
+                return f"<span style='color: rgba(248, 250, 252, 150); font-style: italic;'>* {target_text}...</span>"
+            return ""
+        elif self._display_mode == "en_only":
+            if source_text:
+                return f"<span style='color: rgba(203, 213, 225, 150); font-style: italic;'>* {source_text}...</span>"
+            return ""
+        else: # both
+            parts = []
+            if source_text:
+                parts.append(f"<span style='color: rgba(148, 163, 184, 130); font-size: {en_font_size}pt; font-style: italic;'>* SRC: {source_text}...</span>")
+            if target_text:
+                parts.append(f"<span style='color: rgba(248, 250, 252, 160); font-size: {font_size}pt; font-style: italic; font-weight: bold;'>* VI : {target_text}...</span>")
+            return "<br>".join(parts)
+
+    def _save_history_to_file(self):
+        try:
+            lines = []
+            for data in self._history:
+                source_text = (data.get("source_text", "") or "").strip()
+                target_text = (data.get("target_text", "") or "").strip()
+                now = data.get("timestamp") or datetime.datetime.now().strftime("%H:%M:%S")
+                if source_text and target_text and source_text.lower() == target_text.lower():
+                    line = f"[{now}] {target_text}"
+                else:
+                    line = f"[{now}] SRC: {source_text}\n[{now}] VI : {target_text}"
+                lines.append(line)
+            
+            self._history_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Khong the ghi log file: {e}")
+
+    def _cycle_display_mode(self):
+        modes = ["both", "en_only", "vi_only"]
+        labels = {"both": "Mode: Both", "en_only": "Mode: EN", "vi_only": "Mode: VI"}
+        current_idx = modes.index(self._display_mode)
+        next_idx = (current_idx + 1) % len(modes)
+        self._display_mode = modes[next_idx]
+        self.display_mode_btn.setText(labels[self._display_mode])
+        if self.config:
+            self.config.set("display_mode", self._display_mode)
+        self._reload_history_display()
+
+    def _smart_scroll(self, text_edit, threshold: int = 60):
+        """Only auto-scroll to bottom if the user is already near the bottom."""
+        bar = text_edit.verticalScrollBar()
+        if bar.maximum() == 0 or bar.value() >= bar.maximum() - threshold:
+            bar.setValue(bar.maximum())
+
+    def _reload_history_display(self):
+        font_size = self._get_font_size()
+        en_font_size = max(8, font_size - 3)
+        html_lines = []
+        for data in self._history:
+            source_text = (data.get("source_text", "") or "").strip()
+            target_text = (data.get("target_text", "") or "").strip()
+            now = data.get("timestamp") or datetime.datetime.now().strftime("%H:%M:%S")
+            html_line = self._format_caption_html(source_text, target_text, now, font_size, en_font_size)
+            if html_line:
+                html_lines.append(html_line)
+                
+        if self._current_interim:
+            src_text = (self._current_interim.get("source_text", "") or "").strip()
+            tgt_text = (self._current_interim.get("target_text", "") or "").strip()
+            interim_html = self._format_interim_html(src_text, tgt_text, font_size, en_font_size)
+            if interim_html:
+                html_lines.append(interim_html)
+                
+        # Only update if there is something to show; avoid blanking out existing history
+        if html_lines:
+            body = "<br>".join(html_lines)
+            full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc;">{body}</body></html>'
+            self.history_view.setHtml(full_html)
+            self._smart_scroll(self.history_view)
+
     def _on_update_text(self, data: dict):
+        self._idle_seconds = 0
+        if "timestamp" not in data:
+            data["timestamp"] = datetime.datetime.now().strftime("%H:%M:%S")
+
         source_text = (data.get("source_text", "") or "").strip()
         target_text = (data.get("target_text", "") or "").strip()
         source_lang = data.get("source_lang", "en")
+        is_final = data.get("is_final", True)
 
         lang_map = {"en": "EN", "vi": "VI", "unknown": "UNK"}
         self.lang_label.setText(f"Transcript [{lang_map.get(source_lang, 'UNK')}]")
 
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        if source_text and target_text and source_text.lower() == target_text.lower():
-            line = f"[{now}] {target_text}"
-        else:
-            line = f"[{now}] SRC: {source_text}\n[{now}] VI : {target_text}"
+        if not is_final:
+            self._current_interim = data
+            self._reload_history_display()
+            self.setWindowOpacity(self._get_opacity())
+            self.show()
+            self.raise_()
+            return
 
-        if line.strip():
-            self.history_view.append(line)
-            bar = self.history_view.verticalScrollBar()
-            bar.setValue(bar.maximum())
-            try:
-                with self._history_file.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception as e:
-                logger.warning(f"Khong the ghi history: {e}")
+        # Finalized update: populate history on main thread to avoid threading race conditions
+        merged = False
+        if self._history:
+            last_item = self._history[-1]
+            last_src = (last_item.get("source_text", "") or "").strip()
+            last_tgt = (last_item.get("target_text", "") or "").strip()
+            
+            # Merge if the new text is an incremental update of the last item
+            if (last_src and source_text.startswith(last_src)) or (last_tgt and target_text.startswith(last_tgt)):
+                self._history[-1] = data
+                merged = True
+                
+        if not merged:
+            self._history.append(data)
+            if len(self._history) > 500:
+                self._history.pop(0)
+
+        # Clear interim, reload full history and save to log file
+        if self._current_interim and self._current_interim.get("source_text") == source_text:
+            self._current_interim = None
+        self._reload_history_display()
+        self._save_history_to_file()
 
         self._current_text = {"source": source_text, "translated": target_text, "lang": source_lang}
         self.setWindowOpacity(self._get_opacity())
@@ -328,6 +510,9 @@ class CaptionWindow(QWidget):
         self.raise_()
 
     def _get_opacity(self) -> float:
+        # Keep full opacity if summary updates are paused or mouse is hovering over the window
+        if not self._summary_enabled or self.underMouse():
+            return 1.0
         if self._idle_seconds > 45:
             return max(0.55, 1.0 - (self._idle_seconds - 45) * 0.01)
         return 1.0
@@ -335,6 +520,9 @@ class CaptionWindow(QWidget):
     def _check_fade(self):
         self._idle_seconds += 1
         self.setWindowOpacity(self._get_opacity())
+        if self._idle_seconds >= 8 and self._current_interim is not None:
+            self._current_interim = None
+            self._reload_history_display()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and event.y() <= 48:
@@ -391,10 +579,39 @@ class CaptionWindow(QWidget):
         self.clear()
 
     def load_session_view(self, transcript_lines: list[str], summary_text: str):
-        self.history_view.setPlainText("\n".join(transcript_lines or []))
+        font_size = self._get_font_size()
+        en_font_size = max(8, font_size - 3)
+        html_lines = []
+        for line in (transcript_lines or []):
+            line_str = line.strip()
+            if not line_str:
+                continue
+            if " SRC: " in line_str:
+                if self._display_mode == "vi_only":
+                    continue
+                color = "#94a3b8" if self._display_mode == "both" else "#f8fafc"
+                size_str = f"font-size: {en_font_size}pt;" if self._display_mode == "both" else ""
+                html_lines.append(f"<span style='color: {color}; {size_str}'>{line_str}</span>")
+            elif " VI : " in line_str:
+                if self._display_mode == "en_only":
+                    continue
+                html_lines.append(f"<span style='color: #f8fafc;'>{line_str}</span>")
+            else:
+                html_lines.append(f"<span style='color: #f8fafc;'>{line_str}</span>")
+        
+        body = "<br>".join(html_lines)
+        full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc;">{body}</body></html>'
+        self.history_view.setHtml(full_html)
         self.summary_view.setPlainText((summary_text or "").strip())
-        bar = self.history_view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self._smart_scroll(self.history_view)
+
+    def enterEvent(self, event):
+        self.setWindowOpacity(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setWindowOpacity(self._get_opacity())
+        super().leaveEvent(event)
 
     def clear(self):
         self.history_view.clear()
@@ -402,3 +619,5 @@ class CaptionWindow(QWidget):
         self.lang_label.setText("Session Transcript")
         self._current_text = {"source": "", "translated": "", "lang": ""}
         self._history = []
+
+

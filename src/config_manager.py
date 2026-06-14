@@ -4,7 +4,11 @@ Config Manager — quản lý cấu hình và cài đặt
 import json
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path.cwd() / ".env")
 
 CONFIG_DIR = Path.home() / ".teams-translator"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -19,10 +23,15 @@ DEFAULT_CONFIG = {
     "translation_cache_size": 256,
 
     # Qwen STT
-    "qwen_base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "qwen_stt_model": "qwen3-asr-flash-realtime",
+    "qwen_base_url": "https://dich.vivutrade.io.vn/v1",
+    "qwen_stt_model": "iic/SenseVoiceSmall",
     "qwen_mt_model": "qwen-mt-flash",
     "qwen_api_key": "",
+    "loopback_stt_mode": "realtime",
+    "loopback_realtime_frame_ms": 100,
+    "loopback_realtime_sample_rate": 16000,
+    "loopback_partial_translate_min_chars": 8,
+    "loopback_partial_translate_interval_ms": 350,
 
     # Speech
     "stt_energy_threshold": 300,
@@ -31,7 +40,7 @@ DEFAULT_CONFIG = {
     "stt_phrase_time_limit": 10,
 
     # TTS
-    "tts_backend": "qwen",  # qwen / pyttsx3
+    "tts_backend": "pyttsx3",  # qwen / pyttsx3
     "tts_rate": 180,
     "tts_volume": 1.0,
     "tts_voice": "english",  # english / vietnamese
@@ -87,8 +96,18 @@ class ConfigManager:
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                     loaded = json.load(f)
+                
+                # Migrate old Qwen values to new ASR server settings if they exist
+                if loaded.get("qwen_base_url") == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1":
+                    loaded["qwen_base_url"] = DEFAULT_CONFIG["qwen_base_url"]
+                if loaded.get("qwen_stt_model") == "qwen3-asr-flash-realtime":
+                    loaded["qwen_stt_model"] = DEFAULT_CONFIG["qwen_stt_model"]
+                if loaded.get("tts_backend") == "qwen":
+                    loaded["tts_backend"] = DEFAULT_CONFIG["tts_backend"]
+
                 # Merge with defaults (keep user values, fill missing)
                 self.config = {**DEFAULT_CONFIG, **loaded}
+                self._save()
             except Exception:
                 self.config = dict(DEFAULT_CONFIG)
         else:

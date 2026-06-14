@@ -87,6 +87,7 @@ class Translator:
                 timeout=self._timeout("translation_google_timeout", 1.8),
             )
             if resp.status_code == 200:
+                resp.encoding = "utf-8"
                 data = resp.json()
                 translated = "".join(seg[0] for seg in data[0] if seg[0])
                 if translated:
@@ -155,6 +156,87 @@ class Translator:
         except Exception as e:
             logger.warning("Qwen MT request lỗi: %s", e)
             return None
+
+    def qwen_translate_stream(self, text: str, dest: str = "vi", src: str = "en"):
+        """Translate text via Qwen MT in streaming mode (generator)."""
+        if not text or not text.strip():
+            yield ""
+            return
+
+        key = self._api_key()
+        if not key:
+            yield text
+            return
+
+        base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        if self.config:
+            cfg_url = str(self.config.get("qwen_base_url", "")).strip()
+            if cfg_url:
+                base_url = cfg_url.rstrip("/")
+
+        model = "qwen-mt-flash"
+        if self.config:
+            cfg_model = str(self.config.get("qwen_mt_model", "")).strip()
+            if cfg_model:
+                model = cfg_model
+        model = os.getenv("QWEN_MT_MODEL", model).strip() or "qwen-mt-flash"
+
+        src_full = "English" if src.lower() == "en" else "Vietnamese"
+        dest_full = "Vietnamese" if dest.lower() == "vi" else "English"
+
+        payload = {
+            "model": model,
+            "stream": True,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"Translate {src_full} to {dest_full} only. Return translation text only.",
+                },
+                {
+                    "role": "user",
+                    "content": text.strip(),
+                },
+            ],
+            "temperature": 0.0,
+        }
+
+        try:
+            import json
+            resp = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                stream=True,
+                timeout=self._timeout("translation_qwen_timeout", 4.0),
+            )
+            if resp.status_code >= 400:
+                logger.warning("Qwen MT Stream API status=%s body=%s", resp.status_code, resp.text[:300])
+                yield text
+                return
+
+            accumulated = ""
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8").strip()
+                if not line_str.startswith("data:"):
+                    continue
+                data_content = line_str[5:].strip()
+                if data_content == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data_content)
+                    delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    if delta:
+                        accumulated += delta
+                        yield accumulated
+                except Exception:
+                    continue
+            if not accumulated:
+                yield text
+        except Exception as e:
+            logger.warning("Qwen MT Stream request error: %s", e)
+            yield text
 
     def detect_language(self, text: str) -> str:
         """Phát hiện ngôn ngữ của text. Trả về 'vi', 'en', hoặc 'unknown'."""

@@ -74,6 +74,12 @@ class LiveInputWindow(QWidget):
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
         title_box.addWidget(self.title_label)
+        self.title_label = QLabel("Live Translator AI")
+        self.title_label.setObjectName("titleLabel")
+        self.status_label = QLabel("Listening")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
+        title_box.addWidget(self.title_label)
         title_box.addWidget(self.status_label)
         header.addLayout(title_box, 1)
 
@@ -82,6 +88,9 @@ class LiveInputWindow(QWidget):
         self.caption_btn = self._make_button("Caption", self.app_ref._toggle_caption, "bottomButton")
         self.hide_btn = self._make_button("Thu nhỏ", self.app_ref._minimize_to_floating, "bottomButton")
         self.hide_btn.setText("Thu nhỏ")
+
+        self.setup_audio_btn = self._make_button("Nghe loa & Dịch", self.app_ref.manual_setup_audio, "bottomButton")
+        self.restore_audio_btn = self._make_button("Khôi phục loa", self.app_ref.manual_restore_audio, "bottomButton")
 
         self.min_btn = QPushButton("_")
         self.min_btn.setObjectName("iconButton")
@@ -101,6 +110,8 @@ class LiveInputWindow(QWidget):
         action_row.addWidget(self.mark_btn, 0, 1)
         action_row.addWidget(self.caption_btn, 0, 2)
         action_row.addWidget(self.hide_btn, 0, 3)
+        action_row.addWidget(self.setup_audio_btn, 1, 0, 1, 2)
+        action_row.addWidget(self.restore_audio_btn, 1, 2, 1, 2)
         layout.addLayout(action_row)
 
         caption_header = QHBoxLayout()
@@ -194,7 +205,7 @@ class LiveInputWindow(QWidget):
         self.reply_vi = QTextEdit()
         self.reply_vi.setReadOnly(True)
         self.reply_vi.setObjectName("replyBox")
-        self.reply_vi.setPlaceholderText("Kết quả dịch và bản nháp sẽ hiện tại đây...")
+        self.reply_vi.setPlaceholderText("Kết quả dịch và bản nháp sẽ hiển thị ở đây...")
         layout.addWidget(self.reply_vi, 2)
 
         footer = QHBoxLayout()
@@ -363,18 +374,48 @@ class LiveInputWindow(QWidget):
     def toggle_caption_section(self):
         self.set_caption_enabled(not self._caption_visible)
 
+    def _smart_scroll(self, text_edit, threshold: int = 60):
+        """Only auto-scroll to bottom if the user is already near the bottom."""
+        bar = text_edit.verticalScrollBar()
+        if bar.maximum() == 0 or bar.value() >= bar.maximum() - threshold:
+            bar.setValue(bar.maximum())
+
     def _on_caption_update(self, payload: dict):
         source = (payload.get("source_text") or "").strip()
         translated = (payload.get("target_text") or payload.get("display_text") or "").strip()
+        is_final = payload.get("is_final", True)
         if not source and not translated:
             return
         line = translated if translated else source
         if not line:
             return
-        self._caption_lines.append(line)
+
+        if is_final:
+            # Only clear the partial line if it matches the text being finalized
+            if getattr(self, "_live_partial_line", "") in (source, translated, "..."):
+                self._live_partial_line = ""
+            
+            # Check if this is a translation update of the last finalized English line
+            updated = False
+            if self._caption_lines:
+                last_line = self._caption_lines[-1]
+                # If the last line was the source text, and we now have a new translated/display text, replace it
+                if last_line == source and translated and translated != source:
+                    self._caption_lines[-1] = translated
+                    updated = True
+            
+            if not updated:
+                self._caption_lines.append(line)
+        else:
+            self._live_partial_line = line
+
         if len(self._caption_lines) > 120:
             self._caption_lines = self._caption_lines[-120:]
-        self.caption_view.setPlainText("\n".join(self._caption_lines))
+        display_lines = list(self._caption_lines)
+        partial = getattr(self, "_live_partial_line", "")
+        if partial:
+            display_lines.append(partial)
+        self.caption_view.setPlainText("\n".join(display_lines))
         cursor = self.caption_view.textCursor()
         cursor.select(QTextCursor.Document)
         block_format = QTextBlockFormat()
@@ -382,7 +423,7 @@ class LiveInputWindow(QWidget):
         cursor.mergeBlockFormat(block_format)
         cursor.clearSelection()
         self.caption_view.setTextCursor(cursor)
-        self.caption_view.verticalScrollBar().setValue(self.caption_view.verticalScrollBar().maximum())
+        self._smart_scroll(self.caption_view)
 
     def _on_summary_update(self, summary: str):
         text = (summary or "").strip()
@@ -432,7 +473,7 @@ class LiveInputWindow(QWidget):
         self._caption_lines = list(transcript_lines or [])
         self.caption_view.setPlainText("\n".join(self._caption_lines))
         self.summary_view.setPlainText((summary_text or "").strip())
-        self.caption_view.verticalScrollBar().setValue(self.caption_view.verticalScrollBar().maximum())
+        self._smart_scroll(self.caption_view)
 
     def translate_and_inject(self):
         source_text = self.vn_input.toPlainText().strip()
@@ -524,7 +565,7 @@ class LiveInputWindow(QWidget):
         if not cleaned:
             return ""
         cleaned = re.sub(
-            r"^[\s\u200b\u200c\u200d\ufeff]*(🔊|🔈|🔉|📢|📣|🎤|🎙️|🎙|🗣️|🗣)+\s*",
+            r"^[\s\u200b\u200c\u200d\ufeff]*(ðŸ”Š|ðŸ”ˆ|ðŸ”‰|ðŸ“¢|ðŸ“£|ðŸŽ¤|ðŸŽ™ï¸|ðŸŽ™|ðŸ—£ï¸|ðŸ—£)+\s*",
             "",
             cleaned,
         )
@@ -551,3 +592,4 @@ class LiveInputWindow(QWidget):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
