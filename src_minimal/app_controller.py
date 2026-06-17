@@ -11,19 +11,19 @@ from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QInpu
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QIcon, QCursor
 
-from src.config_manager import ConfigManager
-from src.translator import Translator
-from src.speech_to_text import SpeechToText
-from src.loopback_capture import LoopbackCapture
-from src.caption_window import CaptionWindow
-from src.teams_agent import TeamsAgent
-from src.ui.floating_controls import FloatingControlWidget
-from src.ui.settings_window import SettingsWindow
-from src.ui.live_input_window import LiveInputWindow
-from src.qwen_stt import QwenSTT
-from src.meeting_store import MeetingStore
-from src.reply_assistant import ReplyAssistant
-from src.text_to_speech import TextToSpeech
+from src_minimal.config_manager import ConfigManager
+from src_minimal.translator import Translator
+from src_minimal.speech_to_text import SpeechToText
+from src_minimal.loopback_capture import LoopbackCapture
+from src_minimal.caption_window import CaptionWindow
+from src_minimal.teams_agent import TeamsAgent
+from src_minimal.ui.floating_controls import FloatingControlWidget
+from src_minimal.ui.settings_window import SettingsWindow
+from src_minimal.ui.live_input_window import LiveInputWindow
+from src_minimal.qwen_stt import QwenSTT
+from src_minimal.meeting_store import MeetingStore
+from src_minimal.reply_assistant import ReplyAssistant
+from src_minimal.text_to_speech import TextToSpeech
 
 logger = logging.getLogger("TeamsTranslator")
 
@@ -47,9 +47,10 @@ class TeamsTranslatorApp:
         self._ai_helper = QwenSTT(self.config)
         self.reply_assistant = ReplyAssistant(self.config)
         self.tts = TextToSpeech(self.config)
+        self.receive_tts_enabled = True
 
         # TTS Client to connect to ASR server via WebSocket
-        from src.tts_client import TtsClient
+        from src_minimal.tts_client import TtsClient
         self.tts_client = TtsClient(config_manager=self.config, callback=self._on_tts_client_speak)
 
         # Qt Application
@@ -644,28 +645,17 @@ class TeamsTranslatorApp:
         )
         if len(self._session_transcript) > 300:
             self._session_transcript = self._session_transcript[-300:]
-        self._kick_summary_worker()
+        # self._kick_summary_worker()
 
     def _maybe_update_summary(self):
-        self._kick_summary_worker()
+        pass
 
     def _kick_summary_worker(self):
-        """Start a background worker that catches up completed minute summaries."""
-        if not self._summary_enabled:
-            return
-        token = self._session_token
-        with self._summary_lock:
-            if self._summary_worker_running:
-                return
-            self._summary_worker_running = True
-        threading.Thread(
-            target=self._summary_worker,
-            args=(token,),
-            daemon=True,
-            name="Summary-Worker",
-        ).start()
+        pass
 
     def _summary_worker(self, session_token: int):
+        pass
+    def _summary_worker_disabled(self, session_token: int):
         """
         Summarize completed minutes sequentially.
 
@@ -800,7 +790,7 @@ class TeamsTranslatorApp:
 
     def _load_session_to_view(self, meeting_id: str):
         rows = self.meeting_store.get_transcripts_by_meeting(meeting_id, limit=4000)
-        summary_text = self.meeting_store.get_latest_summary_by_meeting(meeting_id)
+        summary_text = "" # Disabled AI Summary
         transcript_lines = []
         for row in rows:
             en = (row.get("source_text") or "").strip()
@@ -879,14 +869,7 @@ class TeamsTranslatorApp:
             self._notify("📺 Caption overlay đã tắt")
 
     def _toggle_summary_updates(self):
-        self._summary_enabled = not self._summary_enabled
-        self.live_input_window.set_summary_enabled(self._summary_enabled)
-        self.caption_window.set_summary_enabled(self._summary_enabled)
-        if self._summary_enabled:
-            self._notify("AI Summary: Resume")
-            self._kick_summary_worker()
-        else:
-            self._notify("AI Summary: Pause")
+        pass
 
     def _toggle_detached_caption_panel(self):
         self._caption_detached = not self._caption_detached
@@ -999,6 +982,9 @@ class TeamsTranslatorApp:
         self.tray.showMessage("Teams Translator", message, QSystemTrayIcon.MessageIcon.Information, 2000)
 
     def _on_tts_client_speak(self, text: str):
+        if not getattr(self, "receive_tts_enabled", True):
+            logger.info(f"[AppController] TTS Client received speech request but receive_tts is disabled: {text}")
+            return
         logger.info(f"[AppController] TTS Client received speech request: {text}")
         self.tts.speak(text, wait=False)
 
@@ -1072,9 +1058,10 @@ class TeamsTranslatorApp:
         threading.Thread(target=self._run_audio_setup, daemon=True).start()
         # Tự động kiểm tra loopback device khi start
         threading.Thread(target=self._auto_check, daemon=True).start()
-        self._summary_timer = QTimer()
-        self._summary_timer.timeout.connect(self._kick_summary_worker)
-        self._summary_timer.start(10000)
+        # self._summary_timer = QTimer()
+        # self._summary_timer.timeout.connect(self._kick_summary_worker)
+        # self._summary_timer.start(10000)
+        pass
         QTimer.singleShot(3500, self._auto_start_capture)
         logger.info("Teams Translator đã khởi động! Chọn chế độ trong system tray.")
         return self.app.exec()
