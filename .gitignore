@@ -14,3 +14,5 @@ build/
 .venv-tts/
 runtime/
 .gitnexus
+node_modules/
+data/*.db

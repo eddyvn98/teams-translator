@@ -2,7 +2,7 @@ import logging
 import re
 import time
 
-from PyQt5.QtCore import QPoint, Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QTextBlockFormat, QTextCursor
 from PyQt5.QtWidgets import (
     QGridLayout,
@@ -17,6 +17,11 @@ from PyQt5.QtWidgets import (
 )
 
 import pyautogui
+
+try:
+    from src_minimal.ui.icons import get_svg_icon, make_icon_button
+except ImportError:
+    from src.ui.icons import get_svg_icon, make_icon_button
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,12 @@ class LiveInputWindow(QWidget):
         self._live_vi_partial = ""
         self._caption_lines = []  # backward compatibility
         self._caption_visible = True
+        self._detached_mode = False
+        self._en_interim_start_pos = 0
+        self._vi_interim_start_pos = 0
+        self._has_interim = False
+        cfg = getattr(self.app_ref, "config", None)
+        self._input_section_visible = bool(cfg.get("input_section_visible", True)) if cfg else True
         # self._summary_enabled = True
         self._build_ui()
         self.caption_signal.connect(self._on_caption_update)
@@ -69,9 +80,9 @@ class LiveInputWindow(QWidget):
         layout.setSpacing(9)
 
         header = QHBoxLayout()
-        header.setSpacing(10)
+        header.setSpacing(8)
         title_box = QVBoxLayout()
-        title_box.setSpacing(3)
+        title_box.setSpacing(2)
         self.title_label = QLabel("Live Translator AI")
         self.title_label.setObjectName("titleLabel")
         self.status_label = QLabel("Listening")
@@ -81,70 +92,166 @@ class LiveInputWindow(QWidget):
         title_box.addWidget(self.status_label)
         header.addLayout(title_box, 1)
 
-        self.pause_btn = self._make_button("Pause", self.app_ref._toggle_capture, "bottomButton")
-        self.mark_btn = self._make_button("Mark target", self.app_ref._mark_target_input, "bottomButton")
-        self.caption_btn = self._make_button("Caption", self.app_ref._toggle_caption, "bottomButton")
-        self.hide_btn = self._make_button("Thu nhỏ", self.app_ref._minimize_to_floating, "bottomButton")
-        self.hide_btn.setText("Thu nhỏ")
-
-        self.setup_audio_btn = self._make_button("Nghe loa & Dịch", self.app_ref.manual_setup_audio, "bottomButton")
-        self.restore_audio_btn = self._make_button("Khôi phục loa", self.app_ref.manual_restore_audio, "bottomButton")
-
-        self.min_btn = QPushButton("_")
-        self.min_btn.setObjectName("iconButton")
-        self.min_btn.clicked.connect(self.showMinimized)
+        # Unified window control buttons (28x28)
+        self.hide_btn = make_icon_button(
+            "shrink",
+            "Thu nhỏ về thanh điều khiển nổi (Pill)",
+            self.app_ref._minimize_to_floating,
+            color="#795548",
+            btn_size=28,
+            icon_size=14,
+            object_name="iconButton",
+            parent=self.card,
+        )
+        self.min_btn = make_icon_button(
+            "minus",
+            "Thu nhỏ cửa sổ xuống Taskbar",
+            self.showMinimized,
+            color="#795548",
+            btn_size=28,
+            icon_size=14,
+            object_name="iconButton",
+            parent=self.card,
+        )
+        self.close_btn = make_icon_button(
+            "close",
+            "Ẩn cửa sổ",
+            self.hide,
+            color="#795548",
+            btn_size=28,
+            icon_size=14,
+            object_name="closeButton",
+            parent=self.card,
+        )
+        header.addWidget(self.hide_btn)
         header.addWidget(self.min_btn)
-
-        self.close_btn = QPushButton("x")
-        self.close_btn.setObjectName("closeButton")
-        self.close_btn.clicked.connect(self.hide)
         header.addWidget(self.close_btn)
         layout.addLayout(header)
 
-        action_row = QGridLayout()
-        action_row.setHorizontalSpacing(8)
-        action_row.setVerticalSpacing(8)
-        action_row.addWidget(self.pause_btn, 0, 0)
-        action_row.addWidget(self.mark_btn, 0, 1)
-        action_row.addWidget(self.caption_btn, 0, 2)
-        action_row.addWidget(self.hide_btn, 0, 3)
-        action_row.addWidget(self.setup_audio_btn, 1, 0, 1, 2)
-        action_row.addWidget(self.restore_audio_btn, 1, 2, 1, 2)
-        
-        self.receive_tts_btn = self._make_button("Nhận dịch ASR: BẬT", self._toggle_receive_tts, "bottomButton")
-        action_row.addWidget(self.receive_tts_btn, 2, 0, 1, 4)
-        
-        layout.addLayout(action_row)
+        # 2026 Minimalist Action Toolbar (Icon-only, Grouped)
+        action_toolbar = QHBoxLayout()
+        action_toolbar.setSpacing(6)
+
+        self.pause_btn = make_icon_button(
+            "pause",
+            "Tạm dừng thu âm / dịch (Ctrl+Shift+T)",
+            self.app_ref._toggle_capture,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+        self.detach_btn = make_icon_button(
+            "detach",
+            "Tách bảng dịch thành cửa sổ riêng",
+            self.app_ref._toggle_detached_caption_panel,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+        self.caption_btn = make_icon_button(
+            "subtitles",
+            "Bật / Tắt dịch phụ đề (Ctrl+Shift+C)",
+            self.app_ref._toggle_caption,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+        self.mark_btn = make_icon_button(
+            "target",
+            "Chọn ô nhập Teams / App mục tiêu (Ctrl+Shift+V)",
+            self.app_ref._mark_target_input,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+
+        for btn in [self.pause_btn, self.detach_btn, self.caption_btn, self.mark_btn]:
+            action_toolbar.addWidget(btn)
+
+        # Subtle divider
+        toolbar_sep = QFrame(self.card)
+        toolbar_sep.setFrameShape(QFrame.VLine)
+        toolbar_sep.setFrameShadow(QFrame.Plain)
+        toolbar_sep.setStyleSheet("color: #E5D8CD; max-height: 20px; margin: 0 3px;")
+        action_toolbar.addWidget(toolbar_sep)
+
+        self.setup_audio_btn = make_icon_button(
+            "headphones",
+            "Nghe loa & Dịch (Cable Output)",
+            self.app_ref.manual_setup_audio,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+        self.restore_audio_btn = make_icon_button(
+            "speaker",
+            "Khôi phục loa mặc định",
+            self.app_ref.manual_restore_audio,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+        self.receive_tts_btn = make_icon_button(
+            "radio",
+            "Nhận dịch ASR qua TTS",
+            self._toggle_receive_tts,
+            color="#1C1B1F",
+            btn_size=34,
+            icon_size=16,
+            object_name="bottomButton",
+            parent=self.card,
+        )
+
+        for btn in [self.setup_audio_btn, self.restore_audio_btn, self.receive_tts_btn]:
+            action_toolbar.addWidget(btn)
+
+        action_toolbar.addStretch(1)
+        layout.addLayout(action_toolbar)
 
         caption_header = QHBoxLayout()
-        caption_header.setSpacing(8)
+        caption_header.setSpacing(6)
         self.caption_title = QLabel("LIVE TRANSLATION")
         self.caption_title.setObjectName("sectionHeader")
         caption_header.addWidget(self.caption_title)
         caption_header.addStretch(1)
-        self.detach_btn = QPushButton("Tách cửa sổ")
-        self.detach_btn.setText("Tách cửa sổ")
-        self.detach_btn.setObjectName("miniButton")
-        self.detach_btn.clicked.connect(self.app_ref._toggle_detached_caption_panel)
-        caption_header.addWidget(self.detach_btn)
-        self.caption_section_toggle = QPushButton("Ẩn")
-        self.caption_section_toggle.setText("Ẩn")
-        self.caption_section_toggle.setObjectName("miniButton")
-        self.caption_section_toggle.clicked.connect(self.toggle_caption_section)
+        self.caption_section_toggle = make_icon_button(
+            "chevron_up",
+            "Thu gọn bảng Live Caption",
+            self.toggle_caption_section,
+            color="#795548",
+            btn_size=26,
+            icon_size=13,
+            object_name="miniButton",
+            parent=self.card,
+        )
         caption_header.addWidget(self.caption_section_toggle)
         layout.addLayout(caption_header)
 
         # Split side-by-side panel for live caption (EN Left, VI Right)
-        self.caption_layout = QHBoxLayout()
+        self.caption_container = QWidget(self.card)
+        self.caption_layout = QHBoxLayout(self.caption_container)
+        self.caption_layout.setContentsMargins(0, 0, 0, 0)
         self.caption_layout.setSpacing(8)
 
-        self.caption_en_view = QTextEdit()
+        self.caption_en_view = QTextEdit(self.caption_container)
         self.caption_en_view.setReadOnly(True)
         self.caption_en_view.setObjectName("captionBox")
         self.caption_en_view.setPlaceholderText("English caption will appear here...")
         self.caption_en_view.setFont(QFont("Segoe UI", 13))
 
-        self.caption_vi_view = QTextEdit()
+        self.caption_vi_view = QTextEdit(self.caption_container)
         self.caption_vi_view.setReadOnly(True)
         self.caption_vi_view.setObjectName("captionBox")
         self.caption_vi_view.setPlaceholderText("Tiếng Việt dịch ở đây...")
@@ -152,7 +259,7 @@ class LiveInputWindow(QWidget):
 
         self.caption_layout.addWidget(self.caption_en_view, 1)
         self.caption_layout.addWidget(self.caption_vi_view, 1)
-        layout.addLayout(self.caption_layout, 5)
+        layout.addWidget(self.caption_container, 1)
 
         # Create self.caption_view dummy for compatibility
         self.caption_view = self.caption_en_view
@@ -162,32 +269,56 @@ class LiveInputWindow(QWidget):
         self.summary_toggle_btn = None
         self.summary_view = None
 
-        # Ask AI section -> Nhập tiếng việt
-        ask_title = QLabel("NHẬP TIẾNG VIỆT")
-        ask_title.setObjectName("sectionHeader")
-        layout.addWidget(ask_title)
+        # Nhập tiếng việt section
+        input_header = QHBoxLayout()
+        input_header.setSpacing(6)
+        self.input_title = QLabel("NHẬP TIẾNG VIỆT")
+        self.input_title.setObjectName("sectionHeader")
+        input_header.addWidget(self.input_title)
+        input_header.addStretch(1)
+        self.input_section_toggle = make_icon_button(
+            "chevron_up",
+            "Thu gọn phần nhập tiếng Việt",
+            self.toggle_input_section,
+            color="#795548",
+            btn_size=26,
+            icon_size=13,
+            object_name="miniButton",
+            parent=self.card,
+        )
+        input_header.addWidget(self.input_section_toggle)
+        layout.addLayout(input_header)
 
-        self.vn_input = QTextEdit()
+        self.input_container = QWidget(self.card)
+        input_layout = QVBoxLayout(self.input_container)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(8)
+
+        self.vn_input = QTextEdit(self.input_container)
         self.vn_input.setObjectName("mainInput")
         self.vn_input.setPlaceholderText("Nhập nội dung cần dịch / phản hồi...")
         self.vn_input.setFont(QFont("Segoe UI", 11))
-        layout.addWidget(self.vn_input, 2)
+        self.vn_input.textChanged.connect(self._adjust_vn_input_height)
+        input_layout.addWidget(self.vn_input)
 
-        # Cleaned up button row (removed reply_btn and auto_reply_btn)
+        # Cleaned up button row (2026 Minimalist Icon Buttons)
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.speak_btn = self._make_button("Speak EN", self.speak_reply)
-        self.translate_btn = self._make_button("Translate + type", self.translate_and_inject, "primaryButton")
-        self.clear_btn = self._make_button("Clear", self.vn_input.clear, "toolbarButton")
+        btn_row.setSpacing(6)
+        self.clear_btn = make_icon_button("trash", "Xóa nội dung nhập", self.vn_input.clear, color="#795548", btn_size=34, icon_size=16, object_name="toolbarButton", parent=self.card)
+        self.speak_btn = make_icon_button("volume_1", "Phát âm câu trả lời tiếng Anh (Speak EN)", self.speak_reply, color="#795548", btn_size=34, icon_size=16, object_name="toolbarButton", parent=self.card)
+        self.translate_btn = make_icon_button("send", "Dịch sang tiếng Anh & Gõ tự động vào Teams (Ctrl+Enter)", self.translate_and_inject, color="#ffffff", btn_size=34, icon_size=16, object_name="primaryButton", parent=self.card)
 
         # Keep references to removed buttons for backend logic compatibility
         self.reply_btn = QPushButton()
         self.auto_reply_btn = QPushButton()
 
-        btn_row.addWidget(self.speak_btn, 1)
-        btn_row.addWidget(self.translate_btn, 2)
-        btn_row.addWidget(self.clear_btn, 1)
-        layout.addLayout(btn_row)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addWidget(self.speak_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.translate_btn)
+        input_layout.addLayout(btn_row)
+
+        layout.addWidget(self.input_container)
 
         # Instantiate hidden reply boxes for backend compatibility (not added to layout)
         self.reply_en = QTextEdit()
@@ -205,6 +336,8 @@ class LiveInputWindow(QWidget):
         root.addWidget(self.card)
         self._apply_style()
         self._update_receive_tts_btn(self.app_ref.receive_tts_enabled)
+        self._update_input_section_ui(skip_resize=True)
+        self._adjust_vn_input_height()
 
     def _make_button(self, text: str, callback, object_name: str = "toolbarButton") -> QPushButton:
         button = QPushButton(text)
@@ -249,6 +382,8 @@ class LiveInputWindow(QWidget):
             }
             #mainInput {
                 font: 11pt "Segoe UI";
+                padding: 8px 12px;
+                line-height: 1.4;
             }
             #replyBox {
                 color: #1C1B1F;
@@ -269,35 +404,33 @@ class LiveInputWindow(QWidget):
                 line-height: 1.45;
             }
             #toolbarButton, #primaryButton, #iconButton, #closeButton, #miniButton, #bottomButton {
-                color: #1C1B1F;
                 background: #F3E3D3;
                 border: 1px solid #E5D8CD;
-                border-radius: 10px;
-                padding: 7px 11px;
-                font: 700 11px "Segoe UI";
+                border-radius: 8px;
+                padding: 0px;
             }
             #primaryButton {
-                color: white;
                 background: #795548;
                 border-color: #795548;
-                font: 800 11px "Segoe UI";
             }
             #miniButton {
+                min-width: 26px;
+                max-width: 26px;
                 min-height: 26px;
-                padding: 4px 10px;
-                font: 700 10px "Segoe UI";
+                max-height: 26px;
                 background: #FFFFFF;
             }
-            #bottomButton {
+            #bottomButton, #toolbarButton {
+                min-width: 34px;
+                max-width: 34px;
                 min-height: 34px;
-                font: 700 10px "Segoe UI";
+                max-height: 34px;
             }
             #iconButton, #closeButton {
-                min-width: 30px;
-                max-width: 30px;
-                min-height: 30px;
-                padding: 0px;
-                border-radius: 10px;
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
             }
             #toolbarButton:hover, #iconButton:hover, #miniButton:hover, #bottomButton:hover {
                 background: #E5D8CD;
@@ -309,6 +442,14 @@ class LiveInputWindow(QWidget):
             }
             #closeButton:hover {
                 background: #E8D5C4;
+            }
+            QToolTip {
+                background: #FAF2EB;
+                color: #1C1B1F;
+                border: 1px solid #E5D8CD;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font: 600 11px "Segoe UI";
             }
             QScrollBar:vertical {
                 background: transparent;
@@ -328,12 +469,13 @@ class LiveInputWindow(QWidget):
     def _button_state_style(self, background: str, color: str, border: str, min_height: int = 34) -> str:
         return (
             f"background:{background};"
-            f"color:{color};"
             f"border:1px solid {border};"
-            "border-radius:10px;"
-            "padding:7px 11px;"
-            "font:700 11px 'Segoe UI';"
+            "border-radius:8px;"
+            "padding:0px;"
             f"min-height:{min_height}px;"
+            f"max-height:{min_height}px;"
+            f"min-width:{min_height}px;"
+            f"max-width:{min_height}px;"
         )
 
 
@@ -358,66 +500,264 @@ class LiveInputWindow(QWidget):
         pass
 
     def set_detached_mode(self, detached: bool):
-        self.detach_btn.setText("Gắn vào panel" if detached else "Tách cửa sổ")
-        self.caption_title.setVisible(not detached and self._caption_visible)
-        self.caption_section_toggle.setVisible(not detached)
-        self.caption_view.setVisible(not detached and self._caption_visible)
-        pass
+        was_detached = getattr(self, "_detached_mode", False)
+        self._detached_mode = bool(detached)
+        if detached:
+            self.detach_btn.setIcon(get_svg_icon("attach", color="#FFFFFF", size=16))
+            self.detach_btn.setToolTip("Gắn lại bảng dịch vào panel chính")
+            self.detach_btn.setStyleSheet(self._button_state_style("#795548", "#FFFFFF", "#795548"))
+        else:
+            self.detach_btn.setIcon(get_svg_icon("detach", color="#1C1B1F", size=16))
+            self.detach_btn.setToolTip("Tách bảng dịch thành cửa sổ riêng")
+            self.detach_btn.setStyleSheet(self._button_state_style("#F3E3D3", "#1C1B1F", "#E5D8CD"))
+
+        if detached:
+            if not was_detached and self.height() > 400:
+                self._attached_size = self.size()
+            self.caption_title.setText("LIVE TRANSLATION (ĐÃ TÁCH)")
+            self.caption_title.setVisible(False)
+            self.caption_section_toggle.setVisible(False)
+            if hasattr(self, "caption_container"):
+                self.caption_container.setVisible(False)
+            self.caption_en_view.setVisible(False)
+            self.caption_vi_view.setVisible(False)
+
+            min_h = 130 if not getattr(self, "_input_section_visible", True) else 240
+            self.setMinimumSize(420, min_h)
+            self.setMaximumHeight(380 if getattr(self, "_input_section_visible", True) else 180)
+
+            self.card.layout().activate()
+            self.layout().activate()
+            self.updateGeometry()
+
+            compact_h = 250 if getattr(self, "_input_section_visible", True) else 140
+            self.resize(self.width(), compact_h)
+        else:
+            self.setMaximumHeight(16777215)
+            if was_detached and self.height() <= 450:
+                self._detached_height = self.height()
+            self.caption_title.setText("LIVE TRANSLATION")
+            self.caption_title.setVisible(self._caption_visible)
+            self.caption_section_toggle.setVisible(True)
+            if hasattr(self, "caption_container"):
+                self.caption_container.setVisible(self._caption_visible)
+            self.caption_en_view.setVisible(self._caption_visible)
+            self.caption_vi_view.setVisible(self._caption_visible)
+            self.setMinimumSize(460, 660)
+
+            self.card.layout().activate()
+            self.layout().activate()
+            self.updateGeometry()
+
+            restored_h = getattr(self, "_attached_size", None) and self._attached_size.height() or 880
+            if restored_h < 660:
+                restored_h = 880
+            self.resize(self.width(), restored_h)
 
     def toggle_caption_section(self):
         self.set_caption_enabled(not self._caption_visible)
 
-    def _smart_scroll(self, text_edit, threshold: int = 60):
-        """Only auto-scroll to bottom if the user is already near the bottom."""
-        bar = text_edit.verticalScrollBar()
-        if bar.maximum() == 0 or bar.value() >= bar.maximum() - threshold:
-            bar.setValue(bar.maximum())
+    def toggle_input_section(self):
+        self.set_input_section_visible(not getattr(self, "_input_section_visible", True))
 
-    def _on_caption_update(self, payload: dict):
-        source = (payload.get("source_text") or "").strip()
-        translated = (payload.get("target_text") or payload.get("display_text") or "").strip()
-        is_final = payload.get("is_final", True)
-        if not source and not translated:
+    def set_input_section_visible(self, visible: bool):
+        self._input_section_visible = bool(visible)
+        cfg = getattr(self.app_ref, "config", None)
+        if cfg:
+            try:
+                cfg.set("input_section_visible", self._input_section_visible)
+            except Exception:
+                pass
+        self._update_input_section_ui()
+
+    def _update_input_section_ui(self, skip_resize: bool = False):
+        visible = getattr(self, "_input_section_visible", True)
+        if hasattr(self, "input_container"):
+            self.input_container.setVisible(visible)
+        if hasattr(self, "input_section_toggle"):
+            self.input_section_toggle.setIcon(
+                get_svg_icon("chevron_up" if visible else "chevron_down", color="#795548", size=13)
+            )
+            self.input_section_toggle.setToolTip(
+                "Thu gọn phần nhập tiếng Việt" if visible else "Mở rộng phần nhập tiếng Việt"
+            )
+        if hasattr(self, "card") and self.card.layout():
+            self.card.layout().activate()
+        if self.layout():
+            self.layout().activate()
+        self.updateGeometry()
+
+        if getattr(self, "_detached_mode", False):
+            min_h = 130 if not visible else 200
+            self.setMinimumSize(420, min_h)
+            if not skip_resize:
+                compact_h = max(min_h, self.card.layout().sizeHint().height())
+                self.resize(self.width(), compact_h)
+
+    def _adjust_vn_input_height(self):
+        if not hasattr(self, "vn_input") or not self.vn_input:
             return
+        doc = self.vn_input.document()
+        vp_width = self.vn_input.viewport().width()
+        if vp_width > 0:
+            doc.setTextWidth(vp_width)
+        doc_height = doc.size().height()
+        target_h = max(56, min(int(doc_height + 22), 160))
 
-        if is_final:
-            self._live_en_partial = ""
-            self._live_vi_partial = ""
-            
-            # Align EN and VI
-            en_line = source if source else (translated if translated else "")
-            vi_line = translated if translated else (source if source else "")
-            
-            self._caption_en_lines.append(en_line)
-            self._caption_vi_lines.append(vi_line)
-        else:
-            self._live_en_partial = source
-            self._live_vi_partial = translated
+        old_h = self.vn_input.height()
+        if old_h != target_h:
+            self.vn_input.setFixedHeight(target_h)
+            self.vn_input.updateGeometry()
+            if hasattr(self, "input_container"):
+                self.input_container.updateGeometry()
+            if hasattr(self, "card") and self.card.layout():
+                self.card.layout().activate()
+            if self.layout():
+                self.layout().activate()
+            self.updateGeometry()
+            if getattr(self, "_detached_mode", False):
+                compact_h = max(self.minimumHeight(), self.card.layout().sizeHint().height())
+                self.resize(self.width(), compact_h)
 
-        # Keep max 120 lines
-        if len(self._caption_en_lines) > 120:
-            self._caption_en_lines = self._caption_en_lines[-120:]
-            self._caption_vi_lines = self._caption_vi_lines[-120:]
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._adjust_vn_input_height()
 
-        display_en = list(self._caption_en_lines)
-        display_vi = list(self._caption_vi_lines)
+    def _scroll_to_bottom(self, text_edit=None):
+        """Tự động cuộn tới nội dung mới nhất ở dưới cùng."""
+        target = text_edit or self.caption_en_view
+        self._apply_scroll_to_bottom(target)
+        QTimer.singleShot(0, lambda: self._apply_scroll_to_bottom(target))
+        QTimer.singleShot(50, lambda: self._apply_scroll_to_bottom(target))
 
-        if getattr(self, "_live_en_partial", "") or getattr(self, "_live_vi_partial", ""):
-            display_en.append(getattr(self, "_live_en_partial", ""))
-            display_vi.append(getattr(self, "_live_vi_partial", ""))
+    def _apply_scroll_to_bottom(self, target):
+        try:
+            if target is None:
+                return
+            target.moveCursor(QTextCursor.End)
+            target.ensureCursorVisible()
+            bar = target.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+        except Exception:
+            pass
 
-        self.caption_en_view.setPlainText("\n".join(display_en))
-        self.caption_vi_view.setPlainText("\n".join(display_vi))
+    def _smart_scroll(self, text_edit, threshold: int = 60):
+        """Tự động cuộn tới nội dung mới nhất."""
+        self._scroll_to_bottom(text_edit)
 
-        for view in [self.caption_en_view, self.caption_vi_view]:
-            cursor = view.textCursor()
+    @staticmethod
+    def _is_vietnamese(text: str) -> bool:
+        return bool(re.search(r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]', (text or "").lower()))
+
+    def _render_final_caption_lines(self):
+        """Render lại toàn bộ danh sách câu đã chốt cho cả 2 cột EN và VI."""
+        for view, lines, attr in [(self.caption_en_view, self._caption_en_lines, "_en_interim_start_pos"),
+                                   (self.caption_vi_view, self._caption_vi_lines, "_vi_interim_start_pos")]:
+            view.setUpdatesEnabled(False)
+            view.setPlainText("\n".join(lines))
+            cursor = QTextCursor(view.document())
             cursor.select(QTextCursor.Document)
             block_format = QTextBlockFormat()
             block_format.setLineHeight(155, QTextBlockFormat.ProportionalHeight)
             cursor.mergeBlockFormat(block_format)
-            cursor.clearSelection()
-            view.setTextCursor(cursor)
-            self._smart_scroll(view)
+
+            c = view.textCursor()
+            c.movePosition(QTextCursor.End)
+            view.setTextCursor(c)
+            setattr(self, attr, c.position())
+            view.setUpdatesEnabled(True)
+            self._scroll_to_bottom(view)
+        self._has_interim = False
+
+    def _update_interim_lines(self):
+        """Cập nhật mượt mà câu nháp trong cả 2 cột EN và VI tại chỗ mà không dựng lại toàn bộ tài liệu."""
+        for view, text, attr, lines in [(self.caption_en_view, getattr(self, "_live_en_partial", ""), "_en_interim_start_pos", self._caption_en_lines),
+                                         (self.caption_vi_view, getattr(self, "_live_vi_partial", ""), "_vi_interim_start_pos", self._caption_vi_lines)]:
+            start_pos = getattr(self, attr, 0)
+            c = view.textCursor()
+            c.beginEditBlock()
+            c.setPosition(start_pos)
+            c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+            prefix = "\n" if (lines and start_pos > 0) else ""
+            c.insertText(f"{prefix}{text}")
+            c.endEditBlock()
+
+            c_end = view.textCursor()
+            c_end.movePosition(QTextCursor.End)
+            view.setTextCursor(c_end)
+            view.ensureCursorVisible()
+            bar = view.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+        self._has_interim = True
+
+    def _on_caption_update(self, payload: dict):
+        source = (payload.get("source_text") or "").strip()
+        target = (payload.get("target_text") or "").strip()
+        source_lang = (payload.get("source_lang") or "en").strip()
+        is_final = payload.get("is_final", True)
+        if not source and not target:
+            return
+
+        # Content guard: đảm bảo tuyệt đối tiếng Việt vào cột VI, tiếng Anh vào cột EN
+        if self._is_vietnamese(source) and not self._is_vietnamese(target):
+            source, target = target, source
+            source_lang = "en"
+
+        if is_final:
+            self._has_interim = False
+            prev_en_partial = getattr(self, "_live_en_partial", "")
+            self._live_en_partial = ""
+            self._live_vi_partial = ""
+
+            en_line = source if source_lang == "en" else target
+            vi_line = target if source_lang == "en" else source
+
+            # Nếu en_line rỗng nhưng có prev_en_partial hợp lệ
+            if not en_line and prev_en_partial and not self._is_vietnamese(prev_en_partial):
+                en_line = prev_en_partial
+
+            # Chắn an toàn: nếu en_line bị nhiễm tiếng Việt, đẩy sang vi_line
+            if self._is_vietnamese(en_line):
+                if not vi_line or vi_line == "...":
+                    vi_line = en_line
+                en_line = prev_en_partial if (prev_en_partial and not self._is_vietnamese(prev_en_partial)) else ""
+
+            # Check if this is an update (translation arrival) for a recently finalized line
+            updated = False
+            for idx in range(len(self._caption_en_lines) - 1, max(-1, len(self._caption_en_lines) - 4), -1):
+                if en_line and self._caption_en_lines[idx] == en_line:
+                    if vi_line:
+                        self._caption_vi_lines[idx] = vi_line
+                        updated = True
+                    elif not self._caption_vi_lines[idx] or self._caption_vi_lines[idx] == "...":
+                        self._caption_vi_lines[idx] = "..."
+                        updated = True
+                    break
+
+            if not updated:
+                self._caption_en_lines.append(en_line)
+                self._caption_vi_lines.append(vi_line if vi_line else "...")
+
+            # Keep max 120 lines
+            if len(self._caption_en_lines) > 120:
+                self._caption_en_lines = self._caption_en_lines[-120:]
+                self._caption_vi_lines = self._caption_vi_lines[-120:]
+
+            self._render_final_caption_lines()
+        else:
+            if self._is_vietnamese(source):
+                self._live_vi_partial = source
+                self._live_en_partial = target if target else ""
+            elif source_lang == "en":
+                self._live_en_partial = source
+                self._live_vi_partial = target if target else "..."
+            else:
+                self._live_en_partial = target if target else "..."
+                self._live_vi_partial = source
+
+            self._update_interim_lines()
 
     def _on_summary_update(self, summary: str):
         text = (summary or "").strip()
@@ -432,24 +772,62 @@ class LiveInputWindow(QWidget):
             self.summary_view.setTextCursor(cursor)
 
     def _on_capture_state_update(self, capturing: bool):
-        self.pause_btn.setText("Pause" if capturing else "Resume")
         self.status_label.setText("Listening" if capturing else "Paused")
         if capturing:
+            self.pause_btn.setIcon(get_svg_icon("pause", color="#FFFFFF", size=16))
+            self.pause_btn.setToolTip("Tạm dừng thu âm / dịch (Pause)")
             self.pause_btn.setStyleSheet(self._button_state_style("#D32F2F", "#FFFFFF", "#D32F2F"))
         else:
+            self.pause_btn.setIcon(get_svg_icon("play", color="#FFFFFF", size=16))
+            self.pause_btn.setToolTip("Tiếp tục thu âm / dịch (Resume)")
             self.pause_btn.setStyleSheet(self._button_state_style("#795548", "#FFFFFF", "#795548"))
 
     def _on_caption_enabled_update(self, enabled: bool):
         self._caption_visible = enabled
-        detached = self.detach_btn.text().strip().lower().startswith("gắn")
-        self.caption_title.setVisible(enabled and not detached)
-        self.caption_view.setVisible(enabled and not detached)
-        pass
-        self.caption_section_toggle.setText("Ẩn" if enabled else "Hiện")
+        detached = getattr(self, "_detached_mode", False)
+        if detached:
+            self.caption_title.setText("LIVE TRANSLATION (ĐÃ TÁCH)")
+            self.caption_title.setVisible(False)
+            self.caption_section_toggle.setVisible(False)
+            if hasattr(self, "caption_container"):
+                self.caption_container.setVisible(False)
+            self.caption_en_view.setVisible(False)
+            self.caption_vi_view.setVisible(False)
+        else:
+            self.caption_title.setText("LIVE TRANSLATION")
+            self.caption_title.setVisible(enabled)
+            self.caption_section_toggle.setVisible(True)
+            if hasattr(self, "caption_container"):
+                self.caption_container.setVisible(enabled)
+            self.caption_en_view.setVisible(enabled)
+            self.caption_vi_view.setVisible(enabled)
+            self.caption_section_toggle.setIcon(get_svg_icon("chevron_up" if enabled else "chevron_down", color="#795548", size=13))
+            self.caption_section_toggle.setToolTip("Thu gọn bảng Live Caption" if enabled else "Mở rộng bảng Live Caption")
+
+            if not enabled:
+                min_h = 130 if not getattr(self, "_input_section_visible", True) else 240
+                self.setMinimumSize(420, min_h)
+                self.setMaximumHeight(380 if getattr(self, "_input_section_visible", True) else 180)
+                compact_h = 250 if getattr(self, "_input_section_visible", True) else 140
+                self.resize(self.width(), compact_h)
+            else:
+                self.setMaximumHeight(16777215)
+                self.setMinimumSize(460, 660)
+                restored_h = getattr(self, "_attached_size", None) and self._attached_size.height() or 880
+                if restored_h < 660:
+                    restored_h = 880
+                self.resize(self.width(), restored_h)
+
+        if hasattr(self, "card") and self.card.layout():
+            self.card.layout().activate()
+        if self.layout():
+            self.layout().activate()
+        self.updateGeometry()
+
         if enabled:
             self.caption_btn.setStyleSheet(self._button_state_style("#22c55e", "#052e16", "#4ade80"))
         else:
-            self.caption_btn.setStyleSheet(self._button_state_style("#475569", "#e2e8f0", "#64748b"))
+            self.caption_btn.setStyleSheet(self._button_state_style("#FAF2EB", "#1C1B1F", "#E5D8CD"))
 
     def _on_summary_enabled_update(self, enabled: bool):
         pass
@@ -483,10 +861,7 @@ class LiveInputWindow(QWidget):
             else:
                 self._caption_vi_lines.append(line_str)
 
-        self.caption_en_view.setPlainText("\n".join(self._caption_en_lines))
-        self.caption_vi_view.setPlainText("\n".join(self._caption_vi_lines))
-        self._smart_scroll(self.caption_en_view)
-        self._smart_scroll(self.caption_vi_view)
+        self._render_final_caption_lines()
 
     def translate_and_inject(self):
         source_text = self.vn_input.toPlainText().strip()
@@ -591,10 +966,12 @@ class LiveInputWindow(QWidget):
 
     def _update_receive_tts_btn(self, enabled: bool):
         if enabled:
-            self.receive_tts_btn.setText("Nhận dịch ASR: BẬT")
+            self.receive_tts_btn.setIcon(get_svg_icon("radio", color="#FFFFFF", size=16))
+            self.receive_tts_btn.setToolTip("Nhận dịch ASR qua TTS: ĐANG BẬT (Bấm để tắt)")
             self.receive_tts_btn.setStyleSheet(self._button_state_style("#795548", "#FFFFFF", "#795548"))
         else:
-            self.receive_tts_btn.setText("Nhận dịch ASR: TẮT")
+            self.receive_tts_btn.setIcon(get_svg_icon("volume_x", color="#795548", size=16))
+            self.receive_tts_btn.setToolTip("Nhận dịch ASR qua TTS: ĐÃ TẮT (Bấm để bật)")
             self.receive_tts_btn.setStyleSheet(self._button_state_style("#F3E3D3", "#1C1B1F", "#E5D8CD"))
 
     def mousePressEvent(self, event):
@@ -606,7 +983,7 @@ class LiveInputWindow(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._dragging and event.buttons() == Qt.LeftButton:
+        if self._dragging and bool(event.buttons() & Qt.LeftButton):
             self.move(event.globalPos() - self._drag_pos)
             event.accept()
             return

@@ -18,9 +18,10 @@ DEFAULT_CONFIG = {
     "source_lang": "auto",
     "target_lang_vi": "vi",
     "target_lang_en": "en",
-    "translation_google_timeout": 1.8,
+    "translation_google_timeout": 2.2,
     "translation_qwen_timeout": 4.0,
     "translation_cache_size": 256,
+    "google_api_key": "",
 
     # Qwen STT
     "qwen_base_url": "https://dich.vivutrade.io.vn/v1",
@@ -77,6 +78,7 @@ DEFAULT_CONFIG = {
     "tts_enabled": True,
     "caption_enabled": True,
     "auto_type_enabled": True,
+    "input_section_visible": True,
 
     # Hotkeys
     "hotkey_toggle": "ctrl+shift+t",
@@ -100,7 +102,7 @@ class ConfigManager:
                 # Migrate old Qwen values to new ASR server settings if they exist
                 if loaded.get("qwen_base_url") == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1":
                     loaded["qwen_base_url"] = DEFAULT_CONFIG["qwen_base_url"]
-                if loaded.get("qwen_stt_model") == "qwen3-asr-flash-realtime":
+                if loaded.get("qwen_stt_model") in ("qwen3-asr-flash-realtime", "qwen3-livetranslate-flash", "qwen"):
                     loaded["qwen_stt_model"] = DEFAULT_CONFIG["qwen_stt_model"]
                 if loaded.get("tts_backend") == "qwen":
                     loaded["tts_backend"] = DEFAULT_CONFIG["tts_backend"]

@@ -5,8 +5,8 @@ import datetime
 import logging
 from pathlib import Path
 
-from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QFrame,
@@ -18,6 +18,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from src_minimal.ui.icons import get_svg_icon, make_icon_button
+except ImportError:
+    from src.ui.icons import get_svg_icon, make_icon_button
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,8 @@ class CaptionWindow(QWidget):
         self._drag_pos = QPoint()
         self._idle_seconds = 0
         self._current_interim = None
+        self._interim_start_pos = 0
+        self._has_interim = False
 
         self.setWindowTitle("Teams Translator - Caption")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -90,24 +97,52 @@ class CaptionWindow(QWidget):
         self.mode_label.setObjectName("modePill")
         header.addWidget(self.mode_label)
 
-        self.new_session_btn = QPushButton("New")
-        self.new_session_btn.setObjectName("smallButton")
-        self.new_session_btn.clicked.connect(self._new_session)
+        self.new_session_btn = make_icon_button(
+            "plus",
+            "Bắt đầu phiên mới (New Session)",
+            self._new_session,
+            color="#5D4037",
+            btn_size=28,
+            icon_size=14,
+            object_name="iconButton",
+            parent=self.card
+        )
         header.addWidget(self.new_session_btn)
-        
-        self.history_btn = QPushButton("History")
-        self.history_btn.setObjectName("smallButton")
-        self.history_btn.clicked.connect(self._open_history)
+
+        self.history_btn = make_icon_button(
+            "history",
+            "Xem lịch sử cuộc họp (History)",
+            self._open_history,
+            color="#5D4037",
+            btn_size=28,
+            icon_size=14,
+            object_name="iconButton",
+            parent=self.card
+        )
         header.addWidget(self.history_btn)
 
-        self.min_btn = QPushButton("_")
-        self.min_btn.setObjectName("iconButton")
-        self.min_btn.clicked.connect(self.showMinimized)
+        self.min_btn = make_icon_button(
+            "minus",
+            "Thu nhỏ cửa sổ",
+            self.showMinimized,
+            color="#5D4037",
+            btn_size=28,
+            icon_size=14,
+            object_name="iconButton",
+            parent=self.card
+        )
         header.addWidget(self.min_btn)
 
-        self.close_btn = QPushButton("x")
-        self.close_btn.setObjectName("closeButton")
-        self.close_btn.clicked.connect(self.hide)
+        self.close_btn = make_icon_button(
+            "close",
+            "Ẩn cửa sổ Caption",
+            self.hide,
+            color="#5D4037",
+            btn_size=28,
+            icon_size=14,
+            object_name="closeButton",
+            parent=self.card
+        )
         header.addWidget(self.close_btn)
         card_layout.addLayout(header)
 
@@ -182,19 +217,26 @@ class CaptionWindow(QWidget):
                 font: 600 10px "Segoe UI";
             }
             #iconButton, #closeButton {
-                color: #1C1B1F;
                 background: #F3E3D3;
                 border: 1px solid #E5D8CD;
-                border-radius: 6px;
-                padding: 3px 7px;
-                font: 600 10px "Segoe UI";
+                border-radius: 8px;
+                padding: 0px;
             }
-            #smallButton:hover, #iconButton:hover {
+            #iconButton:hover {
                 background: #E5D8CD;
                 border-color: #C8B9AD;
             }
             #closeButton:hover {
                 background: #E8D5C4;
+                border-color: #C8B9AD;
+            }
+            QToolTip {
+                background: #FAF2EB;
+                color: #1C1B1F;
+                border: 1px solid #E5D8CD;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font: 600 11px "Segoe UI";
             }
             QScrollBar:vertical {
                 background: transparent;
@@ -214,17 +256,52 @@ class CaptionWindow(QWidget):
         # Reduced default font size to 11
         return self.config.get("caption_font_size", 11) if self.config else 11
 
+    def ensure_visible_on_screen(self):
+        """Đảm bảo cửa sổ luôn nằm trong vùng hiển thị của ít nhất 1 màn hình khả dụng."""
+        rect = self.geometry()
+        is_visible = False
+        screens = QApplication.screens()
+        for screen in screens:
+            avail = screen.availableGeometry()
+            if avail.intersects(rect):
+                inter = avail.intersected(rect)
+                if inter.width() >= 100 and inter.height() >= 50:
+                    is_visible = True
+                    break
+        if not is_visible:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                new_w = min(self.width(), geo.width() - 40)
+                new_h = min(self.height(), geo.height() - 80)
+                new_x = geo.left() + max(0, (geo.width() - new_w) // 2)
+                new_y = max(geo.top(), geo.bottom() - new_h - 36)
+                self.resize(new_w, new_h)
+                self.move(new_x, new_y)
+                self._save_geometry()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.ensure_visible_on_screen()
+
     def _load_position(self):
+        loaded = False
         if self.config:
             x = self.config.get("caption_x")
             y = self.config.get("caption_y")
+            w = self.config.get("caption_width")
+            h = self.config.get("caption_height")
+            if w and h:
+                self.resize(w, h)
             if x is not None and y is not None:
                 self.move(x, y)
-                return
-        screen = QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
+                loaded = True
+        if not loaded:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
+        self.ensure_visible_on_screen()
 
     def _save_geometry(self):
         if self.config:
@@ -284,15 +361,37 @@ class CaptionWindow(QWidget):
         except Exception as e:
             logger.warning(f"Khong the ghi log file: {e}")
 
+    def _scroll_to_bottom(self, text_edit=None):
+        """Tự động cuộn tới nội dung mới nhất ở dưới cùng."""
+        target = text_edit or self.history_view
+        self._apply_scroll_to_bottom(target)
+        QTimer.singleShot(0, lambda: self._apply_scroll_to_bottom(target))
+        QTimer.singleShot(50, lambda: self._apply_scroll_to_bottom(target))
+
+    def _apply_scroll_to_bottom(self, target):
+        try:
+            if target is None:
+                return
+            target.moveCursor(QTextCursor.End)
+            target.ensureCursorVisible()
+            bar = target.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+        except Exception:
+            pass
+
     def _smart_scroll(self, text_edit, threshold: int = 60):
-        """Only auto-scroll to bottom if the user is already near the bottom."""
-        bar = text_edit.verticalScrollBar()
-        if bar.maximum() == 0 or bar.value() >= bar.maximum() - threshold:
-            bar.setValue(bar.maximum())
+        """Tự động cuộn tới nội dung mới nhất."""
+        self._scroll_to_bottom(text_edit)
+
+    def _update_history_html(self, html_content: str):
+        """Update history_view HTML và tự động cuộn tới nội dung mới nhất."""
+        self.history_view.setHtml(html_content)
+        self._scroll_to_bottom(self.history_view)
 
     def _reload_history_display(self):
-        font_size = self._get_font_size()
-        time_font_size = max(7, font_size - 3)
+        font_size = max(8, self._get_font_size() - 2)
+        time_font_size = max(7, font_size - 2)
         
         html_parts = []
         html_parts.append('<table width="100%" style="table-layout: fixed; border-collapse: collapse; margin: 0; padding: 0;">')
@@ -310,37 +409,69 @@ class CaptionWindow(QWidget):
             
             html_parts.append(
                 f"<tr>"
-                f"<td style='width: 50%; vertical-align: top; padding-right: 8px; padding-bottom: 6px; color: #1C1B1F; font-family: Segoe UI; line-height: 1.3;'>{en_cell}</td>"
-                f"<td style='width: 50%; vertical-align: top; padding-left: 8px; padding-bottom: 6px; border-left: 1px solid #E5D8CD; color: #1C1B1F; font-family: Segoe UI; line-height: 1.3;'>{vi_cell}</td>"
-                f"</tr>"
-            )
-            
-        if self._current_interim:
-            src_text = (self._current_interim.get("source_text", "") or "").strip()
-            tgt_text = (self._current_interim.get("target_text", "") or "").strip()
-            
-            en_interim = f"<span style='color: rgba(28, 27, 31, 130); font-style: italic; font-size: {font_size}pt; font-family: Segoe UI;'>* {src_text}...</span>" if src_text else ""
-            
-            if tgt_text:
-                vi_interim = f"<span style='color: rgba(28, 27, 31, 130); font-style: italic; font-size: {font_size}pt; font-family: Segoe UI;'>* {tgt_text}...</span>"
-            elif src_text:
-                vi_interim = f"<span style='color: rgba(121, 85, 72, 110); font-style: italic; font-size: {font_size}pt; font-family: Segoe UI;'>* ...</span>"
-            else:
-                vi_interim = ""
-                
-            html_parts.append(
-                f"<tr>"
-                f"<td style='width: 50%; vertical-align: top; padding-right: 8px; padding-bottom: 6px;'>{en_interim}</td>"
-                f"<td style='width: 50%; vertical-align: top; padding-left: 8px; padding-bottom: 6px; border-left: 1px solid #E5D8CD;'>{vi_interim}</td>"
+                f"<td style='width: 50%; vertical-align: top; padding-right: 8px; padding-bottom: 2px; color: #1C1B1F; font-family: Segoe UI; line-height: 1.1;'>{en_cell}</td>"
+                f"<td style='width: 50%; vertical-align: top; padding-left: 8px; padding-bottom: 2px; border-left: 1px solid #E5D8CD; color: #1C1B1F; font-family: Segoe UI; line-height: 1.1;'>{vi_cell}</td>"
                 f"</tr>"
             )
             
         html_parts.append('</table>')
         body = "".join(html_parts)
-        full_html = f'<html><body style="margin:0; padding:0;">{body}</body></html>'
+        full_html = f'<html><body style="margin:0; padding:0; line-height:1.1;">{body}</body></html>'
         
+        self.history_view.setUpdatesEnabled(False)
         self.history_view.setHtml(full_html)
-        self._smart_scroll(self.history_view)
+        c = self.history_view.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.history_view.setTextCursor(c)
+        self._interim_start_pos = c.position()
+        self._has_interim = False
+        self.history_view.setUpdatesEnabled(True)
+        self._scroll_to_bottom(self.history_view)
+
+        if self._current_interim:
+            self._update_interim_display()
+
+    def _update_interim_display(self):
+        """Cập nhật mượt mà câu nháp tại chỗ qua QTextCursor."""
+        if not self._current_interim:
+            return
+        font_size = max(8, self._get_font_size() - 2)
+        src_text = (self._current_interim.get("source_text", "") or "").strip()
+        tgt_text = (self._current_interim.get("target_text", "") or "").strip()
+        en_interim = f"<span style='color: rgba(28, 27, 31, 130); font-style: italic; font-size: {font_size}pt;'>* {src_text}...</span>" if src_text else ""
+        vi_interim = f"<span style='color: rgba(28, 27, 31, 130); font-style: italic; font-size: {font_size}pt;'>* {tgt_text}...</span>" if tgt_text else ""
+        interim_html = f"<div style='margin-top: 4px; padding: 2px 0;'>{en_interim} &nbsp; {vi_interim}</div>"
+
+        c = self.history_view.textCursor()
+        c.beginEditBlock()
+        c.setPosition(self._interim_start_pos)
+        c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        c.insertHtml(interim_html)
+        c.endEditBlock()
+        self._has_interim = True
+
+        c_end = self.history_view.textCursor()
+        c_end.movePosition(QTextCursor.End)
+        self.history_view.setTextCursor(c_end)
+        self.history_view.ensureCursorVisible()
+        bar = self.history_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
+
+    def _clear_interim_display(self):
+        """Xóa câu nháp mượt mà khi kết thúc hoặc idle."""
+        if not getattr(self, "_has_interim", False):
+            return
+        c = self.history_view.textCursor()
+        c.beginEditBlock()
+        c.setPosition(self._interim_start_pos)
+        c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        c.removeSelectedText()
+        c.endEditBlock()
+        self._has_interim = False
+        bar = self.history_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
 
     def _on_update_text(self, data: dict):
         self._idle_seconds = 0
@@ -357,20 +488,22 @@ class CaptionWindow(QWidget):
 
         if not is_final:
             self._current_interim = data
-            self._reload_history_display()
+            self._update_interim_display()
             self.setWindowOpacity(self._get_opacity())
-            self.show()
-            self.raise_()
+            if not self.isVisible():
+                self.show()
+                self.raise_()
             return
 
         # Finalized update: populate history
+        self._current_interim = None
+        self._has_interim = False
         merged = False
         if self._history:
             last_item = self._history[-1]
             last_src = (last_item.get("source_text", "") or "").strip()
             last_tgt = (last_item.get("target_text", "") or "").strip()
-            
-            if (last_src and source_text.startswith(last_src)) or (last_tgt and target_text.startswith(last_tgt)):
+            if (last_src and (source_text == last_src or source_text.startswith(last_src))) or (last_tgt and (target_text == last_tgt or target_text.startswith(last_tgt))):
                 self._history[-1] = data
                 merged = True
                 
@@ -379,15 +512,14 @@ class CaptionWindow(QWidget):
             if len(self._history) > 500:
                 self._history.pop(0)
 
-        if self._current_interim and self._current_interim.get("source_text") == source_text:
-            self._current_interim = None
         self._reload_history_display()
         self._save_history_to_file()
 
         self._current_text = {"source": source_text, "translated": target_text, "lang": source_lang}
         self.setWindowOpacity(self._get_opacity())
-        self.show()
-        self.raise_()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
 
     def _get_opacity(self) -> float:
         if self.underMouse():
@@ -401,7 +533,7 @@ class CaptionWindow(QWidget):
         self.setWindowOpacity(self._get_opacity())
         if self._idle_seconds >= 8 and self._current_interim is not None:
             self._current_interim = None
-            self._reload_history_display()
+            self._clear_interim_display()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and event.y() <= 48:
@@ -511,3 +643,6 @@ class CaptionWindow(QWidget):
         self.lang_label.setText("Session Transcript")
         self._current_text = {"source": "", "translated": "", "lang": ""}
         self._history = []
+        self._current_interim = None
+        self._interim_start_pos = 0
+        self._has_interim = False

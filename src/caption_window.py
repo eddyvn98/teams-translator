@@ -5,10 +5,12 @@ import datetime
 import logging
 from pathlib import Path
 
-from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+from PyQt5.QtCore import QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -18,6 +20,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from src.ui.icons import get_svg_icon, make_icon_button
+except ImportError:
+    from src_minimal.ui.icons import get_svg_icon, make_icon_button
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,8 @@ class CaptionWindow(QWidget):
         self._drag_pos = QPoint()
         self._idle_seconds = 0
         self._current_interim = None
+        self._interim_start_pos = 0
+        self._has_interim = False
 
         self.setWindowTitle("Teams Translator - Caption")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
@@ -70,67 +79,149 @@ class CaptionWindow(QWidget):
         self.card = QFrame(self)
         self.card.setObjectName("captionCard")
         card_layout = QVBoxLayout(self.card)
-        card_layout.setContentsMargins(12, 10, 12, 10)
+        card_layout.setContentsMargins(14, 10, 14, 10)
         card_layout.setSpacing(8)
 
+        # 1. Window Header
         header = QHBoxLayout()
         header.setSpacing(8)
-        self.status_dot = QLabel()
-        self.status_dot.setFixedSize(9, 9)
-        self.status_dot.setObjectName("statusDot")
-        header.addWidget(self.status_dot)
 
-        title_box = QVBoxLayout()
-        title_box.setSpacing(0)
+        self.wave_icon = QLabel()
+        self.wave_icon.setPixmap(get_svg_icon("soundwave", color="#38bdf8", size=18).pixmap(18, 18))
+        header.addWidget(self.wave_icon)
+
         self.title_label = QLabel("Live Caption")
         self.title_label.setObjectName("titleLabel")
-        self.lang_label = QLabel("Session Transcript")
-        self.lang_label.setObjectName("metaLabel")
-        title_box.addWidget(self.title_label)
-        title_box.addWidget(self.lang_label)
-        header.addLayout(title_box, 1)
+        header.addWidget(self.title_label)
 
-        self.mode_label = QLabel("LISTENING")
-        self.mode_label.setObjectName("modePill")
-        header.addWidget(self.mode_label)
+        self.lang_label = QLabel(self.card)
+        self.lang_label.setVisible(False)
 
-        # Mode button to cycle: Both / English only / Vietnamese only
-        self.display_mode_btn = QPushButton()
-        self.display_mode_btn.setObjectName("smallButton")
-        self.display_mode_btn.clicked.connect(self._cycle_display_mode)
-        labels = {"both": "Mode: Both", "en_only": "Mode: EN", "vi_only": "Mode: VI"}
-        self.display_mode_btn.setText(labels.get(self._display_mode, "Mode: Both"))
-        header.addWidget(self.display_mode_btn)
+        header.addStretch(1)
 
-        self.summary_toggle = QPushButton("Summary")
-        self.summary_toggle.setObjectName("smallButton")
-        self.summary_toggle.clicked.connect(self._toggle_summary)
-        header.addWidget(self.summary_toggle)
-        self.summary_pause_btn = QPushButton("Pause")
-        self.summary_pause_btn.setObjectName("smallButton")
-        self.summary_pause_btn.clicked.connect(self._toggle_summary_updates)
-        header.addWidget(self.summary_pause_btn)
-        self.new_session_btn = QPushButton("New")
-        self.new_session_btn.setObjectName("smallButton")
-        self.new_session_btn.clicked.connect(self._new_session)
-        header.addWidget(self.new_session_btn)
-        self.history_btn = QPushButton("History")
-        self.history_btn.setObjectName("smallButton")
-        self.history_btn.clicked.connect(self._open_history)
-        header.addWidget(self.history_btn)
-
-        self.min_btn = QPushButton("_")
-        self.min_btn.setObjectName("iconButton")
-        self.min_btn.clicked.connect(self.showMinimized)
+        self.min_btn = make_icon_button(
+            "minus",
+            "Thu nhỏ cửa sổ",
+            self.showMinimized,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        self.max_btn = make_icon_button(
+            "expand",
+            "Phóng to / Khôi phục",
+            self._toggle_maximize,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        self.close_btn = make_icon_button(
+            "close",
+            "Ẩn cửa sổ Caption",
+            self.hide,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="closeButton",
+            parent=self.card
+        )
         header.addWidget(self.min_btn)
-
-        self.close_btn = QPushButton("x")
-        self.close_btn.setObjectName("closeButton")
-        self.close_btn.clicked.connect(self.hide)
+        header.addWidget(self.max_btn)
         header.addWidget(self.close_btn)
         card_layout.addLayout(header)
 
-        # Live Active Caption Box (Interim Updates)
+        # 2. Filter & Toolbar row
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        self.mode_btn_both = QPushButton("EN + VI")
+        self.mode_btn_en = QPushButton("English")
+        self.mode_btn_vi = QPushButton("Tiếng Việt")
+        for btn in [self.mode_btn_both, self.mode_btn_en, self.mode_btn_vi]:
+            btn.setObjectName("modePillButton")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(24)
+            toolbar.addWidget(btn)
+
+        self.mode_btn_both.clicked.connect(lambda: self.set_display_mode("both"))
+        self.mode_btn_en.clicked.connect(lambda: self.set_display_mode("en_only"))
+        self.mode_btn_vi.clicked.connect(lambda: self.set_display_mode("vi_only"))
+
+        # Hidden display_mode_btn kept for test_svg_buttons compatibility
+        self.display_mode_btn = make_icon_button("languages", "Chế độ hiển thị", self._cycle_display_mode, color="#cbd5e1", btn_size=24, icon_size=12, object_name="iconButton", parent=self.card)
+        self.display_mode_btn.setVisible(False)
+
+        toolbar.addSpacing(6)
+
+        # Toggle switch for AI Summary
+        self.summary_toggle_switch = QCheckBox("Show AI Summary")
+        self.summary_toggle_switch.setObjectName("summaryToggleSwitch")
+        self.summary_toggle_switch.setCursor(Qt.PointingHandCursor)
+        self.summary_toggle_switch.setChecked(not self._summary_collapsed)
+        self.summary_toggle_switch.toggled.connect(self._on_summary_switch_toggled)
+        toolbar.addWidget(self.summary_toggle_switch)
+
+        # Hidden summary_toggle kept for test_svg_buttons compatibility
+        self.summary_toggle = make_icon_button("sparkles", "Ẩn / Hiện tóm tắt AI", self._toggle_summary, color="#cbd5e1", btn_size=24, icon_size=12, object_name="iconButton", parent=self.card)
+        self.summary_toggle.setVisible(False)
+
+        toolbar.addStretch(1)
+
+        self.summary_pause_btn = make_icon_button(
+            "pause",
+            "Tạm dừng cập nhật AI Summary",
+            self._toggle_summary_updates,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        toolbar.addWidget(self.summary_pause_btn)
+
+        self.new_session_btn = make_icon_button(
+            "plus",
+            "Bắt đầu phiên mới (New Session)",
+            self._new_session,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        toolbar.addWidget(self.new_session_btn)
+
+        self.history_btn = make_icon_button(
+            "history",
+            "Xem lịch sử cuộc họp (History)",
+            self._open_history,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        toolbar.addWidget(self.history_btn)
+
+        self.settings_btn = make_icon_button(
+            "settings",
+            "Cài đặt",
+            self._open_settings,
+            color="#cbd5e1",
+            btn_size=26,
+            icon_size=13,
+            object_name="iconButton",
+            parent=self.card
+        )
+        toolbar.addWidget(self.settings_btn)
+
+        card_layout.addLayout(toolbar)
+
+        # 3. Live Active Caption Box (Interim Updates)
         self.live_caption_box = QFrame()
         self.live_caption_box.setObjectName("liveCaptionBox")
         live_layout = QVBoxLayout(self.live_caption_box)
@@ -150,7 +241,6 @@ class CaptionWindow(QWidget):
         live_layout.addWidget(self.live_en_label)
         live_layout.addWidget(self.live_vi_label)
         self.live_caption_box.setVisible(False)
-        # card_layout.addWidget(self.live_caption_box, 2) # Hidden to unify into history_view
 
         self.history_view = QTextEdit()
         self.history_view.setReadOnly(True)
@@ -163,21 +253,47 @@ class CaptionWindow(QWidget):
         self.summary_view.setObjectName("summaryView")
         self.summary_view.setPlaceholderText("AI summary will update during the session...")
         card_layout.addWidget(self.summary_view, 2)
+        self.summary_view.setVisible(not self._summary_collapsed and self._summary_enabled)
 
+        # 4. Footer row
         footer = QHBoxLayout()
+        footer.setContentsMargins(2, 2, 2, 2)
+        footer.setSpacing(6)
+
+        self.auto_scroll_dot = QLabel()
+        self.auto_scroll_dot.setObjectName("statusDot")
+        self.auto_scroll_dot.setFixedSize(7, 7)
+        footer.addWidget(self.auto_scroll_dot)
+
+        self.auto_scroll_label = QLabel("Auto-scroll on")
+        self.auto_scroll_label.setObjectName("autoScrollLabel")
+        footer.addWidget(self.auto_scroll_label)
+
         footer.addStretch(1)
-        self.resize_hint = QLabel("drag corner to resize")
-        self.resize_hint.setObjectName("resizeHint")
-        footer.addWidget(self.resize_hint)
+
+        self.font_size_combo = QComboBox(self.card)
+        self.font_size_combo.setObjectName("fontSizeCombo")
+        for fs in [12, 14, 16, 18, 20, 24]:
+            self.font_size_combo.addItem(f"Font size: {fs}px", fs)
+
+        current_fs = self._get_font_size()
+        for i in range(self.font_size_combo.count()):
+            if self.font_size_combo.itemData(i) == current_fs:
+                self.font_size_combo.setCurrentIndex(i)
+                break
+        self.font_size_combo.currentIndexChanged.connect(self._on_font_combo_changed)
+        footer.addWidget(self.font_size_combo)
+
         self.grip = QSizeGrip(self.card)
         footer.addWidget(self.grip)
         card_layout.addLayout(footer)
 
         root.addWidget(self.card)
         self._apply_style()
+        self._update_mode_pill_styles()
 
         w = self.config.get("caption_width", 720) if self.config else 720
-        h = self.config.get("caption_height", 360) if self.config else 360
+        h = self.config.get("caption_height", 380) if self.config else 380
         self.resize(w, h)
 
     def _apply_style(self):
@@ -187,110 +303,192 @@ class CaptionWindow(QWidget):
         self.setStyleSheet(
             """
             #captionCard {
-                background: rgba(10, 14, 22, 252);
-                border: 1px solid rgba(123, 164, 255, 120);
+                background: rgba(10, 16, 30, 250);
+                border: 1px solid rgba(56, 189, 248, 0.25);
                 border-radius: 14px;
             }
             #statusDot {
                 background: #22c55e;
-                border-radius: 4px;
+                border-radius: 3px;
             }
             #titleLabel {
                 color: #f8fafc;
                 font: 700 13px "Segoe UI";
             }
-            #metaLabel, #resizeHint {
-                color: rgba(203, 213, 225, 170);
-                font: 10px "Segoe UI";
+            #autoScrollLabel {
+                color: #22c55e;
+                font: 600 11px "Segoe UI";
             }
-            #modePill {
-                color: #bbf7d0;
-                background: rgba(34, 197, 94, 35);
-                border: 1px solid rgba(34, 197, 94, 95);
+            #modePillButton {
                 border-radius: 6px;
-                padding: 3px 6px;
-                font: 700 9px "Segoe UI";
+                padding: 2px 10px;
+                font: 600 11px "Segoe UI";
             }
-            #historyView, #summaryView {
+            #summaryToggleSwitch {
+                color: #cbd5e1;
+                font: 500 11px "Segoe UI";
+                spacing: 6px;
+            }
+            #summaryToggleSwitch::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 3px;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                background: rgba(255, 255, 255, 0.05);
+            }
+            #summaryToggleSwitch::indicator:checked {
+                background: #2563eb;
+                border-color: #3b82f6;
+            }
+            #fontSizeCombo {
+                background: rgba(255, 255, 255, 0.06);
+                color: #cbd5e1;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 6px;
+                padding: 2px 8px;
+                font: 11px "Segoe UI";
+            }
+            #fontSizeCombo QAbstractItemView {
+                background: #0b1325;
                 color: #f8fafc;
-                background: rgba(15, 23, 42, 170);
-                border: 1px solid rgba(148, 163, 184, 75);
+                border: 1px solid rgba(56, 189, 248, 0.3);
+                selection-background-color: #2563eb;
+            }
+            #historyView {
+                color: #f8fafc;
+                background: rgba(8, 14, 26, 220);
+                border: 1px solid rgba(255, 255, 255, 0.08);
                 border-radius: 10px;
-                padding: 8px;
+                padding: 10px;
                 selection-background-color: #2563eb;
             }
             #summaryView {
                 color: #dbeafe;
-                background: rgba(30, 41, 59, 185);
-            }
-            #smallButton {
-                color: #e2e8f0;
-                background: rgba(51, 65, 85, 180);
-                border: 1px solid rgba(148, 163, 184, 90);
-                border-radius: 6px;
-                padding: 3px 6px;
-                font: 600 10px "Segoe UI";
+                background: rgba(18, 28, 48, 220);
+                border: 1px solid rgba(56, 189, 248, 0.2);
+                border-radius: 10px;
+                padding: 8px;
             }
             #iconButton, #closeButton {
-                color: #e2e8f0;
-                background: rgba(51, 65, 85, 180);
-                border: 1px solid rgba(148, 163, 184, 90);
-                border-radius: 6px;
-                padding: 3px 7px;
-                font: 600 10px "Segoe UI";
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 0px;
             }
-            #smallButton:hover, #iconButton:hover {
-                background: rgba(71, 85, 105, 220);
+            #iconButton:hover {
+                background: rgba(255, 255, 255, 0.16);
+                border-color: rgba(255, 255, 255, 0.25);
             }
             #closeButton:hover {
-                background: #dc2626;
+                background: rgba(239, 68, 68, 0.85);
                 border-color: #ef4444;
+            }
+            QToolTip {
+                background: #0b1325;
+                color: #f8fafc;
+                border: 1px solid rgba(56, 189, 248, 0.3);
+                border-radius: 6px;
+                padding: 4px 8px;
+                font: 600 11px "Segoe UI";
             }
             QScrollBar:vertical {
                 background: transparent;
-                width: 10px;
+                width: 8px;
             }
             QScrollBar::handle:vertical {
                 background: rgba(148, 163, 184, 120);
-                border-radius: 5px;
+                border-radius: 4px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
             }
-            #liveCaptionBox {
-                background: rgba(30, 41, 59, 140);
-                border: 1px dashed rgba(123, 164, 255, 90);
-                border-radius: 10px;
-                padding: 6px;
-                margin-top: 4px;
-                margin-bottom: 4px;
-            }
-            #liveEnLabel {
-                color: rgba(203, 213, 225, 180);
-                font-style: italic;
-            }
-            #liveViLabel {
-                color: #f8fafc;
-                font-weight: bold;
-                font-style: italic;
-            }
             """
         )
+
+    def _update_mode_pill_styles(self):
+        active = "background: #2563eb; color: #ffffff; border: 1px solid #3b82f6; border-radius: 6px; font: 600 11px 'Segoe UI'; padding: 2px 10px;"
+        inactive = "background: rgba(255, 255, 255, 0.05); color: #94a3b8; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; font: 600 11px 'Segoe UI'; padding: 2px 10px;"
+        self.mode_btn_both.setStyleSheet(active if self._display_mode == "both" else inactive)
+        self.mode_btn_en.setStyleSheet(active if self._display_mode == "en_only" else inactive)
+        self.mode_btn_vi.setStyleSheet(active if self._display_mode == "vi_only" else inactive)
+
+    def set_display_mode(self, mode: str):
+        self._display_mode = mode
+        if self.config:
+            self.config.set("display_mode", mode)
+        self._update_mode_pill_styles()
+        self._reload_history_display()
+
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _open_settings(self):
+        if self.app_ref and hasattr(self.app_ref, "_open_settings"):
+            self.app_ref._open_settings()
+
+    def _on_summary_switch_toggled(self, checked: bool):
+        self._summary_collapsed = not checked
+        self.summary_view.setVisible(checked)
+
+    def _on_font_combo_changed(self, idx: int):
+        fs = self.font_size_combo.itemData(idx)
+        if fs and self.config:
+            self.config.set("caption_font_size", fs)
+        self._apply_style()
+        self._reload_history_display()
 
     def _get_font_size(self) -> int:
         return self.config.get("caption_font_size", 14) if self.config else 14
 
+    def ensure_visible_on_screen(self):
+        """Đảm bảo cửa sổ luôn nằm trong vùng hiển thị của ít nhất 1 màn hình khả dụng."""
+        rect = self.geometry()
+        is_visible = False
+        screens = QApplication.screens()
+        for screen in screens:
+            avail = screen.availableGeometry()
+            if avail.intersects(rect):
+                inter = avail.intersected(rect)
+                if inter.width() >= 100 and inter.height() >= 50:
+                    is_visible = True
+                    break
+        if not is_visible:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                new_w = min(self.width(), geo.width() - 40)
+                new_h = min(self.height(), geo.height() - 80)
+                new_x = geo.left() + max(0, (geo.width() - new_w) // 2)
+                new_y = max(geo.top(), geo.bottom() - new_h - 36)
+                self.resize(new_w, new_h)
+                self.move(new_x, new_y)
+                self._save_geometry()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.ensure_visible_on_screen()
+
     def _load_position(self):
+        loaded = False
         if self.config:
             x = self.config.get("caption_x")
             y = self.config.get("caption_y")
+            w = self.config.get("caption_width")
+            h = self.config.get("caption_height")
+            if w and h:
+                self.resize(w, h)
             if x is not None and y is not None:
                 self.move(x, y)
-                return
-        screen = QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
+                loaded = True
+        if not loaded:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 36)
+        self.ensure_visible_on_screen()
 
     def _save_geometry(self):
         if self.config:
@@ -323,7 +521,7 @@ class CaptionWindow(QWidget):
     def _toggle_summary(self):
         self._summary_collapsed = not self._summary_collapsed
         self.summary_view.setVisible(not self._summary_collapsed)
-        self.summary_toggle.setText("Show summary" if self._summary_collapsed else "Summary")
+        self.summary_toggle.setToolTip("Hiện bảng tóm tắt AI" if self._summary_collapsed else "Ẩn bảng tóm tắt AI")
 
     def _toggle_summary_updates(self):
         if self.app_ref:
@@ -339,11 +537,13 @@ class CaptionWindow(QWidget):
 
     def set_summary_enabled(self, enabled: bool):
         self._summary_enabled = bool(enabled)
-        self.summary_pause_btn.setText("Pause" if self._summary_enabled else "Resume")
+        icon_name = "pause" if self._summary_enabled else "play"
+        self.summary_pause_btn.setIcon(get_svg_icon(icon_name, color="#cbd5e1", size=14))
+        self.summary_pause_btn.setToolTip("Tạm dừng cập nhật AI Summary" if self._summary_enabled else "Tiếp tục cập nhật AI Summary")
         if self._summary_enabled:
             self.summary_pause_btn.setStyleSheet("")
         else:
-            self.summary_pause_btn.setStyleSheet("QPushButton{background:#475569;color:#e2e8f0;}")
+            self.summary_pause_btn.setStyleSheet("QPushButton{background:#475569;}")
 
     def _on_update_summary(self, text: str):
         if text and text.strip():
@@ -356,49 +556,45 @@ class CaptionWindow(QWidget):
     def _format_caption_html(self, source_text: str, target_text: str, now: str, font_size: int, en_font_size: int) -> str:
         if not source_text and not target_text:
             return ""
-        # If identical, render 1 line
         if source_text and target_text and source_text.lower() == target_text.lower():
             text_to_show = source_text if self._display_mode == "en_only" else target_text
-            return f"<span style='color: #f8fafc;'>[{now}] {text_to_show}</span>"
-        # Render based on display_mode
+            return f"<div style='margin-bottom: 8px;'><span style='color: #64748b; font-size: {en_font_size}pt;'>[{now}]</span>&nbsp;&nbsp;<span style='color: #f8fafc;'>{text_to_show}</span></div>"
+
         if self._display_mode == "vi_only":
             if target_text:
-                return f"<span style='color: #f8fafc;'>[{now}] VI : {target_text}</span>"
+                return f"<div style='margin-bottom: 8px;'><span style='color: #64748b; font-size: {en_font_size}pt;'>[{now}]</span>&nbsp;&nbsp;<span style='color: #f8fafc;'>{target_text}</span></div>"
             elif source_text:
-                return f"<span style='color: #64748b; font-size: {en_font_size}pt; font-style: italic;'>[{now}] (Dịch...) {source_text}</span>"
+                return f"<div style='margin-bottom: 8px;'><span style='color: #64748b; font-size: {en_font_size}pt;'>[{now}]</span>&nbsp;&nbsp;<span style='color: #94a3b8; font-style: italic;'>{source_text}</span></div>"
             return ""
         elif self._display_mode == "en_only":
             if source_text:
-                return f"<span style='color: #f8fafc;'>[{now}] SRC: {source_text}</span>"
+                return f"<div style='margin-bottom: 8px;'><span style='color: #64748b; font-size: {en_font_size}pt;'>[{now}]</span>&nbsp;&nbsp;<span style='color: #f8fafc;'>{source_text}</span></div>"
             return ""
         else: # both
             parts = []
             if source_text:
-                parts.append(f"<span style='color: #94a3b8; font-size: {en_font_size}pt;'>[{now}] SRC: {source_text}</span>")
+                parts.append(f"<div style='margin-top: 4px;'><span style='color: #64748b; font-size: {en_font_size}pt;'>[{now}]</span>&nbsp;&nbsp;<span style='color: #f8fafc;'>{source_text}</span></div>")
             if target_text:
-                parts.append(f"<span style='color: #f8fafc;'>[{now}] VI : {target_text}</span>")
-            else:
-                parts.append(f"<span style='color: #64748b; font-size: {en_font_size}pt; font-style: italic;'>[Dịch...]</span>")
-            return "<br>".join(parts)
+                parts.append(f"<div style='margin-top: 2px; margin-bottom: 8px; padding-left: 20px;'><span style='color: #93c5fd; font-style: italic;'>{target_text}</span></div>")
+            elif source_text:
+                parts.append(f"<div style='margin-top: 2px; margin-bottom: 8px; padding-left: 20px;'><span style='color: #64748b; font-style: italic;'>[Đang dịch...]</span></div>")
+            return "".join(parts)
 
     def _format_interim_html(self, source_text: str, target_text: str, font_size: int, en_font_size: int) -> str:
         if not source_text and not target_text:
             return ""
         if self._display_mode == "vi_only":
-            if target_text:
-                return f"<span style='color: rgba(248, 250, 252, 150); font-style: italic;'>* {target_text}...</span>"
-            return ""
+            txt = target_text or source_text
+            return f"<div style='color: rgba(147, 197, 253, 0.7); font-style: italic; margin-top: 4px;'><i>... {txt}</i></div>"
         elif self._display_mode == "en_only":
-            if source_text:
-                return f"<span style='color: rgba(203, 213, 225, 150); font-style: italic;'>* {source_text}...</span>"
-            return ""
+            return f"<div style='color: rgba(248, 250, 252, 0.7); font-style: italic; margin-top: 4px;'><i>... {source_text}</i></div>"
         else: # both
             parts = []
             if source_text:
-                parts.append(f"<span style='color: rgba(148, 163, 184, 130); font-size: {en_font_size}pt; font-style: italic;'>* SRC: {source_text}...</span>")
+                parts.append(f"<div style='color: rgba(248, 250, 252, 0.6); font-style: italic; margin-top: 4px;'><i>... {source_text}</i></div>")
             if target_text:
-                parts.append(f"<span style='color: rgba(248, 250, 252, 160); font-size: {font_size}pt; font-style: italic; font-weight: bold;'>* VI : {target_text}...</span>")
-            return "<br>".join(parts)
+                parts.append(f"<div style='color: rgba(147, 197, 253, 0.75); font-style: italic; margin-top: 2px; padding-left: 20px;'><i>... {target_text}</i></div>")
+            return "".join(parts)
 
     def _save_history_to_file(self):
         try:
@@ -419,24 +615,47 @@ class CaptionWindow(QWidget):
 
     def _cycle_display_mode(self):
         modes = ["both", "en_only", "vi_only"]
-        labels = {"both": "Mode: Both", "en_only": "Mode: EN", "vi_only": "Mode: VI"}
-        current_idx = modes.index(self._display_mode)
+        labels = {"both": "Song ngữ EN + VI", "en_only": "Chỉ tiếng Anh (EN)", "vi_only": "Chỉ tiếng Việt (VI)"}
+        current_idx = modes.index(self._display_mode) if self._display_mode in modes else 0
         next_idx = (current_idx + 1) % len(modes)
         self._display_mode = modes[next_idx]
-        self.display_mode_btn.setText(labels[self._display_mode])
+        self.display_mode_btn.setToolTip(f"Chuyển chế độ hiển thị (Hiện tại: {labels[self._display_mode]})")
         if self.config:
             self.config.set("display_mode", self._display_mode)
         self._reload_history_display()
 
+    def _scroll_to_bottom(self, text_edit=None):
+        """Tự động cuộn tới nội dung mới nhất ở dưới cùng."""
+        target = text_edit or self.history_view
+        self._apply_scroll_to_bottom(target)
+        # Đảm bảo cuộn tới đáy ngay cả khi Qt cần thêm chu kỳ tính toán layout bất đồng bộ
+        QTimer.singleShot(0, lambda: self._apply_scroll_to_bottom(target))
+        QTimer.singleShot(50, lambda: self._apply_scroll_to_bottom(target))
+
+    def _apply_scroll_to_bottom(self, target):
+        try:
+            if target is None:
+                return
+            target.moveCursor(QTextCursor.End)
+            target.ensureCursorVisible()
+            bar = target.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+        except Exception:
+            pass
+
     def _smart_scroll(self, text_edit, threshold: int = 60):
-        """Only auto-scroll to bottom if the user is already near the bottom."""
-        bar = text_edit.verticalScrollBar()
-        if bar.maximum() == 0 or bar.value() >= bar.maximum() - threshold:
-            bar.setValue(bar.maximum())
+        """Tự động cuộn tới nội dung mới nhất."""
+        self._scroll_to_bottom(text_edit)
+
+    def _update_history_html(self, html_content: str):
+        """Update history_view HTML và tự động cuộn tới nội dung mới nhất."""
+        self.history_view.setHtml(html_content)
+        self._scroll_to_bottom(self.history_view)
 
     def _reload_history_display(self):
-        font_size = self._get_font_size()
-        en_font_size = max(8, font_size - 3)
+        font_size = max(8, self._get_font_size() - 2)
+        en_font_size = max(8, font_size - 2)
         html_lines = []
         for data in self._history:
             source_text = (data.get("source_text", "") or "").strip()
@@ -446,19 +665,69 @@ class CaptionWindow(QWidget):
             if html_line:
                 html_lines.append(html_line)
                 
-        if self._current_interim:
-            src_text = (self._current_interim.get("source_text", "") or "").strip()
-            tgt_text = (self._current_interim.get("target_text", "") or "").strip()
-            interim_html = self._format_interim_html(src_text, tgt_text, font_size, en_font_size)
-            if interim_html:
-                html_lines.append(interim_html)
-                
-        # Only update if there is something to show; avoid blanking out existing history
+        self.history_view.setUpdatesEnabled(False)
         if html_lines:
             body = "<br>".join(html_lines)
-            full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc;">{body}</body></html>'
+            full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc; line-height:1.15;">{body}</body></html>'
             self.history_view.setHtml(full_html)
-            self._smart_scroll(self.history_view)
+        else:
+            self.history_view.clear()
+
+        c = self.history_view.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.history_view.setTextCursor(c)
+        self._interim_start_pos = c.position()
+        self._has_interim = False
+        self.history_view.setUpdatesEnabled(True)
+        self._scroll_to_bottom(self.history_view)
+
+        if self._current_interim:
+            self._update_interim_display()
+
+    def _update_interim_display(self):
+        """Cập nhật mượt câu nháp tại chỗ qua QTextCursor, không dựng lại toàn bộ tài liệu."""
+        if not self._current_interim:
+            return
+        font_size = max(8, self._get_font_size() - 2)
+        en_font_size = max(8, font_size - 2)
+        src_text = (self._current_interim.get("source_text", "") or "").strip()
+        tgt_text = (self._current_interim.get("target_text", "") or "").strip()
+        interim_html = self._format_interim_html(src_text, tgt_text, font_size, en_font_size)
+        if not interim_html:
+            return
+
+        c = self.history_view.textCursor()
+        c.beginEditBlock()
+        c.setPosition(self._interim_start_pos)
+        c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        prefix = "<br>" if (self._history and self._interim_start_pos > 0) else ""
+        c.insertHtml(f"{prefix}{interim_html}")
+        c.endEditBlock()
+        self._has_interim = True
+
+        # Cuộn êm đến cuối dòng, không giật màn hình
+        c_end = self.history_view.textCursor()
+        c_end.movePosition(QTextCursor.End)
+        self.history_view.setTextCursor(c_end)
+        self.history_view.ensureCursorVisible()
+        bar = self.history_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
+
+    def _clear_interim_display(self):
+        """Xóa câu nháp mượt mà khi hết thời gian chờ hoặc sang câu mới."""
+        if not getattr(self, "_has_interim", False):
+            return
+        c = self.history_view.textCursor()
+        c.beginEditBlock()
+        c.setPosition(self._interim_start_pos)
+        c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        c.removeSelectedText()
+        c.endEditBlock()
+        self._has_interim = False
+        bar = self.history_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
 
     def _on_update_text(self, data: dict):
         self._idle_seconds = 0
@@ -475,13 +744,16 @@ class CaptionWindow(QWidget):
 
         if not is_final:
             self._current_interim = data
-            self._reload_history_display()
+            self._update_interim_display()
             self.setWindowOpacity(self._get_opacity())
-            self.show()
-            self.raise_()
+            if not self.isVisible():
+                self.show()
+                self.raise_()
             return
 
         # Finalized update: populate history on main thread to avoid threading race conditions
+        self._current_interim = None
+        self._has_interim = False
         merged = False
         if self._history:
             last_item = self._history[-1]
@@ -498,16 +770,15 @@ class CaptionWindow(QWidget):
             if len(self._history) > 500:
                 self._history.pop(0)
 
-        # Clear interim, reload full history and save to log file
-        if self._current_interim and self._current_interim.get("source_text") == source_text:
-            self._current_interim = None
+        # Reload full history and save to log file
         self._reload_history_display()
         self._save_history_to_file()
 
         self._current_text = {"source": source_text, "translated": target_text, "lang": source_lang}
         self.setWindowOpacity(self._get_opacity())
-        self.show()
-        self.raise_()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
 
     def _get_opacity(self) -> float:
         # Keep full opacity if summary updates are paused or mouse is hovering over the window
@@ -522,7 +793,7 @@ class CaptionWindow(QWidget):
         self.setWindowOpacity(self._get_opacity())
         if self._idle_seconds >= 8 and self._current_interim is not None:
             self._current_interim = None
-            self._reload_history_display()
+            self._clear_interim_display()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and event.y() <= 48:
@@ -579,8 +850,8 @@ class CaptionWindow(QWidget):
         self.clear()
 
     def load_session_view(self, transcript_lines: list[str], summary_text: str):
-        font_size = self._get_font_size()
-        en_font_size = max(8, font_size - 3)
+        font_size = max(8, self._get_font_size() - 2)
+        en_font_size = max(8, font_size - 2)
         html_lines = []
         for line in (transcript_lines or []):
             line_str = line.strip()
@@ -600,10 +871,14 @@ class CaptionWindow(QWidget):
                 html_lines.append(f"<span style='color: #f8fafc;'>{line_str}</span>")
         
         body = "<br>".join(html_lines)
-        full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc;">{body}</body></html>'
-        self.history_view.setHtml(full_html)
+        full_html = f'<html><body style="margin:0; padding:0; color:#f8fafc; line-height:1.0;">{body}</body></html>'
+        self._update_history_html(full_html)
+        c = self.history_view.textCursor()
+        c.movePosition(QTextCursor.End)
+        self.history_view.setTextCursor(c)
+        self._interim_start_pos = c.position()
+        self._has_interim = False
         self.summary_view.setPlainText((summary_text or "").strip())
-        self._smart_scroll(self.history_view)
 
     def enterEvent(self, event):
         self.setWindowOpacity(1.0)
@@ -619,5 +894,8 @@ class CaptionWindow(QWidget):
         self.lang_label.setText("Session Transcript")
         self._current_text = {"source": "", "translated": "", "lang": ""}
         self._history = []
+        self._current_interim = None
+        self._interim_start_pos = 0
+        self._has_interim = False
 
 

@@ -130,7 +130,11 @@ class TeamsTranslatorApp:
         self.act_caption.setChecked(visible)
         if visible:
             if self._caption_detached:
+                self.caption_window.ensure_visible_on_screen()
+                self.caption_window.showNormal()
                 self.caption_window.show()
+                self.caption_window.raise_()
+                self.caption_window.activateWindow()
             self.live_input_window.set_caption_enabled(True)
             self._notify("📺 Caption đã hiện lại")
         else:
@@ -466,17 +470,6 @@ class TeamsTranslatorApp:
             if self._status["caption"] and result.get("display_text"):
                 self.caption_window.show_caption(result)
                 self.live_input_window.update_live_caption(result)
-                
-            # Translate partial text asynchronously, throttled to once every 800ms
-            now = time.time()
-            if now - getattr(self, "_last_partial_translate_at", 0.0) >= 0.8:
-                self._last_partial_translate_at = now
-                import threading
-                threading.Thread(
-                    target=self._async_translate_and_update_gui,
-                    args=(text, "en", "vi", "loopback", False),
-                    daemon=True
-                ).start()
             return
 
         # 2. Nếu là final ASR (đã nói xong câu)
@@ -484,26 +477,38 @@ class TeamsTranslatorApp:
         if len(text.strip()) < 2:
             return
         self._last_loopback_display = ""
+        prev_partial = getattr(self, "_last_loopback_partial_text", "")
         self._last_loopback_partial_text = ""
         self._last_loopback_partial_at = 0.0
-        
-        # Dispatch the finalized English caption immediately to the GUI so it prints instantly without waiting for translation
-        immediate_result = {
-            "source_text": text,
-            "target_text": "",
-            "source_lang": "en",
-            "display_text": text,
-            "is_final": True,
-            "skip_session_append": True
-        }
-        self._dispatch_to_gui(immediate_result, "loopback")
 
-        import threading
-        threading.Thread(
-            target=self._async_translate_and_update_gui,
-            args=(text, "en", "vi", "loopback"),
-            daemon=True
-        ).start()
+        detected_lang = self.translator.detect_language(text)
+        if detected_lang == "vi":
+            en_source = prev_partial if (prev_partial and self.translator.detect_language(prev_partial) == "en") else ""
+            final_result = {
+                "source_text": en_source,
+                "target_text": text,
+                "source_lang": "en",
+                "display_text": text,
+                "is_final": True
+            }
+            self._dispatch_to_gui(final_result, "loopback")
+        else:
+            immediate_result = {
+                "source_text": text,
+                "target_text": "",
+                "source_lang": "en",
+                "display_text": text,
+                "is_final": True,
+                "skip_session_append": True
+            }
+            self._dispatch_to_gui(immediate_result, "loopback")
+
+            import threading
+            threading.Thread(
+                target=self._async_translate_and_update_gui,
+                args=(text, "en", "vi", "loopback"),
+                daemon=True
+            ).start()
 
     def _should_show_loopback_partial(self, text: str) -> bool:
         current = " ".join((text or "").split())
@@ -602,13 +607,13 @@ class TeamsTranslatorApp:
 
             # Translate using Google Translate / cache (avoid Qwen dependency)
             translated_text = self.translator.translate(stable_text, dest=dest_lang, src=src_lang)
-            final_text = translated_text if translated_text else stable_text
+            final_text = translated_text if translated_text else ""
 
             final_result = {
                 "source_text": stable_text,
                 "target_text": final_text,
                 "source_lang": src_lang,
-                "display_text": final_text,
+                "display_text": final_text if final_text else stable_text,
                 "is_final": is_final
             }
             if not is_final:
@@ -859,7 +864,11 @@ class TeamsTranslatorApp:
         self._status["caption"] = self._caption_enabled
         if self._caption_enabled:
             if self._caption_detached:
+                self.caption_window.ensure_visible_on_screen()
+                self.caption_window.showNormal()
                 self.caption_window.show()
+                self.caption_window.raise_()
+                self.caption_window.activateWindow()
             self.live_input_window.set_caption_enabled(True)
             self._notify("📺 Caption overlay đã bật")
         else:
@@ -876,9 +885,16 @@ class TeamsTranslatorApp:
         self.live_input_window.set_detached_mode(self._caption_detached)
         self.caption_window.set_summary_enabled(self._summary_enabled)
         if self._caption_detached:
-            if self._caption_enabled:
-                self.caption_window.show()
-            self._notify("Đã tách Live Caption + AI Summary")
+            self._caption_enabled = True
+            self.act_caption.setChecked(True)
+            self._status["caption"] = True
+            self.live_input_window.set_caption_enabled(True)
+            self.caption_window.ensure_visible_on_screen()
+            self.caption_window.showNormal()
+            self.caption_window.show()
+            self.caption_window.raise_()
+            self.caption_window.activateWindow()
+            self._notify("Đã tách Live Caption")
         else:
             self.caption_window.hide()
             self._notify("Đã gắn vào panel chính")
@@ -1331,12 +1347,11 @@ class SettingsWindow:
         tabs.addTab(audio_tab, "Âm thanh")
 
         # Buttons
+        from src_minimal.ui.icons import make_icon_button
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        btn_detect = QPushButton("🔊 Kiểm tra thiết bị audio")
-        btn_detect.clicked.connect(lambda: self.app_ref._show_audio_devices())
+        btn_detect = make_icon_button("activity", "Kiểm tra thiết bị âm thanh", lambda: self.app_ref._show_audio_devices(), color="#334155", btn_size=36, icon_size=18)
         btn_layout.addWidget(btn_detect)
-        btn_close = QPushButton("Đóng")
-        btn_close.clicked.connect(self.window.close)
+        btn_close = make_icon_button("check", "Đóng cài đặt", self.window.close, color="#334155", btn_size=36, icon_size=18)
         btn_layout.addWidget(btn_close)
         layout.addLayout(btn_layout)

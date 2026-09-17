@@ -268,15 +268,45 @@ class LoopbackCapture:
         # Target ~100ms blocks
         block_size = int(sample_rate * 0.1)
 
-        try:
-            stream = sd.InputStream(
-                device=device_index,
-                channels=actual_channels,
-                samplerate=sample_rate,
-                dtype="float32",
-                blocksize=block_size,
-                callback=callback
+        stream = None
+        candidate_configs = [
+            (actual_channels, sample_rate),
+            (2, sample_rate),
+            (1, sample_rate),
+            (actual_channels, 44100),
+            (actual_channels, 48000),
+            (actual_channels, 16000),
+        ]
+        unique_configs = []
+        for ch, sr in candidate_configs:
+            if (ch, sr) not in unique_configs:
+                unique_configs.append((ch, sr))
+
+        for ch, sr in unique_configs:
+            try:
+                stream = sd.InputStream(
+                    device=device_index,
+                    channels=ch,
+                    samplerate=sr,
+                    dtype="float32",
+                    blocksize=int(sr * 0.1),
+                    callback=callback
+                )
+                actual_channels = ch
+                sample_rate = sr
+                break
+            except Exception:
+                continue
+
+        if not stream:
+            logger.error(
+                "❌ Lỗi khởi động InputStream cho loopback device %s. "
+                "Vui lòng kiểm tra quyền truy cập Microphone trong Windows Settings -> Privacy & security -> Microphone.",
+                device_index
             )
+            return
+
+        try:
             with stream:
                 while not self._stop_event.is_set() and self._capturing and self._realtime_stt:
                     try:
@@ -296,7 +326,7 @@ class LoopbackCapture:
                     except Exception as e:
                         logger.error(f"Lỗi gửi audio realtime: {e}")
         except Exception as e:
-            logger.error(f"Lỗi khởi động InputStream: {e}")
+            logger.error(f"Lỗi stream loopback: {e}")
 
     def _capture_rest_loop(self, device_index: int):
         """

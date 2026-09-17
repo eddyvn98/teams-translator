@@ -4,6 +4,11 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
+try:
+    from src_minimal.ui.icons import get_svg_icon, make_icon_button
+except ImportError:
+    from src.ui.icons import get_svg_icon, make_icon_button
+
 
 class SettingsWindow:
     """Cửa sổ cài đặt."""
@@ -60,10 +65,8 @@ class SettingsWindow:
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-        btn_detect = QPushButton("🔊 Kiểm tra thiết bị audio")
-        btn_detect.clicked.connect(lambda: self.app_ref._show_audio_devices())
+        btn_detect = make_icon_button("activity", "Kiểm tra thiết bị âm thanh", lambda: self.app_ref._show_audio_devices(), color="#334155", btn_size=36, icon_size=18)
         btn_layout.addWidget(btn_detect)
-        btn_close = QPushButton("Đóng")
-        btn_close.clicked.connect(self.window.close)
+        btn_close = make_icon_button("check", "Đóng cài đặt", self.window.close, color="#334155", btn_size=36, icon_size=18)
         btn_layout.addWidget(btn_close)
         layout.addLayout(btn_layout)

@@ -1,5 +1,10 @@
-from PyQt5.QtCore import QPoint, Qt
+from PyQt5.QtCore import QPoint, QSize, Qt
 from PyQt5.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QWidget
+
+try:
+    from src_minimal.ui.icons import get_svg_icon, make_icon_button
+except ImportError:
+    from src.ui.icons import get_svg_icon, make_icon_button
 
 
 class FloatingControlWidget(QWidget):
@@ -22,19 +27,58 @@ class FloatingControlWidget(QWidget):
         self.card = QFrame(self)
         self.card.setObjectName("controlPill")
         layout = QHBoxLayout(self.card)
-        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(6)
 
         self.status_dot = QLabel()
         self.status_dot.setObjectName("statusDot")
-        self.status_dot.setFixedSize(9, 9)
+        self.status_dot.setFixedSize(8, 8)
         layout.addWidget(self.status_dot)
 
-        self.pause_btn = self._make_button("Resume", "primaryButton", self._on_pause_resume_clicked)
-        self.caption_btn = self._make_button("Caption", "toolButton", self.app_ref._toggle_caption)
-        self.input_btn = self._make_button("Mở panel", "toolButton", self.app_ref._restore_main_panel)
-        self.input_btn.setText("Mở panel")
-        self.exit_btn = self._make_button("x", "closeButton", self.app_ref._quit)
+        # 2026 Minimalist icon buttons (No text)
+        self.pause_btn = make_icon_button(
+            "play",
+            "Tiếp tục thu âm / dịch (Resume)",
+            self._on_pause_resume_clicked,
+            color="#ffffff",
+            btn_size=32,
+            icon_size=15,
+            object_name="primaryButton",
+            parent=self.card
+        )
+
+        self.caption_btn = make_icon_button(
+            "subtitles",
+            "Bật / Tắt cửa sổ Caption (Ctrl+Shift+C)",
+            self.app_ref._toggle_caption,
+            color="#cbd5e1",
+            btn_size=32,
+            icon_size=16,
+            object_name="toolButton",
+            parent=self.card
+        )
+
+        self.input_btn = make_icon_button(
+            "panel",
+            "Mở bảng điều khiển dịch đầy đủ",
+            self.app_ref._restore_main_panel,
+            color="#cbd5e1",
+            btn_size=32,
+            icon_size=16,
+            object_name="toolButton",
+            parent=self.card
+        )
+
+        self.exit_btn = make_icon_button(
+            "close",
+            "Thoát ứng dụng",
+            self.app_ref._quit,
+            color="#cbd5e1",
+            btn_size=32,
+            icon_size=15,
+            object_name="closeButton",
+            parent=self.card
+        )
 
         for button in [self.pause_btn, self.caption_btn, self.input_btn, self.exit_btn]:
             layout.addWidget(button)
@@ -42,47 +86,39 @@ class FloatingControlWidget(QWidget):
         root.addWidget(self.card)
         self._apply_style()
 
-    def _make_button(self, text: str, object_name: str, callback) -> QPushButton:
-        button = QPushButton(text, self.card)
-        button.setObjectName(object_name)
-        button.setCursor(Qt.PointingHandCursor)
-        button.clicked.connect(callback)
-        return button
-
     def _apply_style(self):
         self.setStyleSheet(
             """
             #controlPill {
-                background: #FAF2EB;
-                border: 2px solid #E5D8CD;
-                border-radius: 18px;
+                background: rgba(15, 23, 42, 230);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 20px;
             }
             #statusDot {
-                background: #6B686E;
+                background: #64748b;
                 border-radius: 4px;
             }
             #primaryButton, #toolButton, #closeButton {
-                color: #1C1B1F;
-                background: #F3E3D3;
-                border: 1px solid #E5D8CD;
-                border-radius: 12px;
-                padding: 6px 10px;
-                font: 700 11px "Segoe UI";
-            }
-            #primaryButton {
-                min-width: 70px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 10px;
+                padding: 0px;
             }
             #primaryButton:hover, #toolButton:hover {
-                background: #E5D8CD;
-                border-color: #C8B9AD;
-            }
-            #closeButton {
-                min-width: 24px;
-                padding-left: 7px;
-                padding-right: 7px;
+                background: rgba(255, 255, 255, 0.16);
+                border-color: rgba(255, 255, 255, 0.22);
             }
             #closeButton:hover {
-                background: #E8D5C4;
+                background: rgba(239, 68, 68, 0.85);
+                border-color: #ef4444;
+            }
+            QToolTip {
+                background: #0f172a;
+                color: #f8fafc;
+                border: 1px solid rgba(148, 163, 184, 0.3);
+                border-radius: 6px;
+                padding: 4px 8px;
+                font: 600 11px "Segoe UI";
             }
             """
         )
@@ -90,20 +126,20 @@ class FloatingControlWidget(QWidget):
     def sync_state(self, capturing: bool):
         self._capturing = capturing
         if capturing:
-            self.pause_btn.setText("Pause")
-            self.status_dot.setStyleSheet("background: #D32F2F; border-radius: 4px;")
+            self.pause_btn.setIcon(get_svg_icon("pause", color="#111827", size=15))
+            self.pause_btn.setToolTip("Tạm dừng thu âm / dịch (Pause)")
+            self.status_dot.setStyleSheet("background: #22c55e; border-radius: 4px;")
             self.pause_btn.setStyleSheet(
-                "QPushButton { color: #FFFFFF; background: #D32F2F; border: 1px solid #D32F2F; "
-                "border-radius: 12px; padding: 6px 10px; font: 800 11px 'Segoe UI'; min-width: 70px; }"
-                "QPushButton:hover { background: #B71C1C; }"
+                "QPushButton { background: #f59e0b; border: 1px solid #fbbf24; border-radius: 10px; }"
+                "QPushButton:hover { background: #fbbf24; }"
             )
         else:
-            self.pause_btn.setText("Resume")
-            self.status_dot.setStyleSheet("background: #6B686E; border-radius: 4px;")
+            self.pause_btn.setIcon(get_svg_icon("play", color="#ffffff", size=15))
+            self.pause_btn.setToolTip("Tiếp tục thu âm / dịch (Resume)")
+            self.status_dot.setStyleSheet("background: #64748b; border-radius: 4px;")
             self.pause_btn.setStyleSheet(
-                "QPushButton { color: #FFFFFF; background: #795548; border: 1px solid #795548; "
-                "border-radius: 12px; padding: 6px 10px; font: 800 11px 'Segoe UI'; min-width: 70px; }"
-                "QPushButton:hover { background: #5D3E35; }"
+                "QPushButton { background: #2563eb; border: 1px solid #3b82f6; border-radius: 10px; }"
+                "QPushButton:hover { background: #1d4ed8; }"
             )
 
     def _on_pause_resume_clicked(self):

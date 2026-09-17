@@ -60,12 +60,15 @@ class TtsClient:
         logger.info("[TTS Client] WebSocket client thread stopped.")
 
     def _run_loop(self):
+        import socket
         while self._is_running:
             ws_url = self._get_ws_url()
             logger.info(f"[TTS Client] Connecting to: {ws_url}")
             try:
-                # Create a persistent websocket connection
+                # Create a persistent websocket connection with initial handshake timeout
                 self._ws = websocket.create_connection(ws_url, timeout=10)
+                # Use a small recv timeout so the loop can periodically check self._is_running
+                self._ws.settimeout(2.0)
                 logger.info("[TTS Client] Connected to TTS Server successfully.")
                 
                 # Maintain connection and receive messages
@@ -84,10 +87,15 @@ class TtsClient:
                             logger.info(f"[TTS Client] Received broadcast speech request: '{text}'")
                             if self.callback:
                                 self.callback(text)
-                    except websocket.WebSocketConnectionClosedException:
+                    except (websocket.WebSocketTimeoutException, socket.timeout, TimeoutError):
+                        # Normal socket timeout while waiting for incoming speech requests
+                        continue
+                    except (websocket.WebSocketConnectionClosedException, ConnectionResetError, BrokenPipeError):
                         logger.warning("[TTS Client] Connection closed by server.")
                         break
                     except Exception as e:
+                        if not self._is_running:
+                            break
                         # Prevent loop crash on parse errors
                         logger.error(f"[TTS Client] Error in message loop: {e}")
                         time.sleep(0.5)
