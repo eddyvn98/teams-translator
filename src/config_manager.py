@@ -23,8 +23,9 @@ DEFAULT_CONFIG = {
     "translation_cache_size": 256,
     "google_api_key": "",
 
-    # Qwen STT
+    # Qwen STT / ASR
     "qwen_base_url": "https://dich.vivutrade.io.vn/v1",
+    "qwen_asr_url": "https://dich.vivutrade.io.vn",
     "qwen_stt_model": "iic/SenseVoiceSmall",
     "qwen_mt_model": "qwen-mt-flash",
     "qwen_api_key": "",
@@ -106,6 +107,8 @@ class ConfigManager:
                     loaded["qwen_stt_model"] = DEFAULT_CONFIG["qwen_stt_model"]
                 if loaded.get("tts_backend") == "qwen":
                     loaded["tts_backend"] = DEFAULT_CONFIG["tts_backend"]
+                if not loaded.get("qwen_asr_url") or "127.0.0.1" in str(loaded.get("qwen_asr_url")) or "localhost" in str(loaded.get("qwen_asr_url")):
+                    loaded["qwen_asr_url"] = DEFAULT_CONFIG["qwen_asr_url"]
 
                 # Merge with defaults (keep user values, fill missing)
                 self.config = {**DEFAULT_CONFIG, **loaded}

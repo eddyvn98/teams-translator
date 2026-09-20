@@ -3,10 +3,11 @@
  */
 
 export class StreamWebSocketClient {
-  constructor({ onTranscript, onTranslation, onSentence, onStatus, onError }) {
+  constructor({ onTranscript, onTranslation, onSentence, onRemoteSpeech, onStatus, onError }) {
     this.onTranscript = onTranscript;
     this.onTranslation = onTranslation;
     this.onSentence = onSentence;
+    this.onRemoteSpeech = onRemoteSpeech;
     this.onStatus = onStatus;
     this.onError = onError;
     this.ws = null;
@@ -53,6 +54,13 @@ export class StreamWebSocketClient {
           const data = JSON.parse(event.data);
           if (data.type === 'sentence' && this.onSentence) {
             this.onSentence(data);
+          } else if (data.type === 'remote_speech') {
+            if (this.onSentence && data.source) {
+              this.onSentence(data);
+            }
+            if (this.onRemoteSpeech) {
+              this.onRemoteSpeech(data);
+            }
           } else if (data.type === 'transcript' && this.onTranscript) {
             this.onTranscript(data);
           } else if (data.type === 'translation' && this.onTranslation) {
@@ -107,7 +115,7 @@ export class StreamWebSocketClient {
     if (this.ws) {
       try {
         this.ws.close();
-      } catch (e) {
+      } catch {
         // ignore
       }
       this.ws = null;

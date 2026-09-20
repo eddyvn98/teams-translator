@@ -16,3 +16,4 @@ runtime/
 .gitnexus
 node_modules/
 data/*.db
+scripts/create_aggregate

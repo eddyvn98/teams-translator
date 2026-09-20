@@ -36,7 +36,12 @@ export class AudioCaptureService {
 
       const audioTracks = this.mediaStream.getAudioTracks();
       if (!audioTracks || audioTracks.length === 0) {
-        throw new Error('Vui lòng tích chọn "Chia sẻ kèm âm thanh của thẻ" trong hộp thoại!');
+        const isFirefox = navigator.userAgent.toLowerCase().includes('firefox');
+        const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+        if (isFirefox || isSafari) {
+          throw new Error('Trình duyệt Firefox/Safari trên macOS không hỗ trợ WebRTC Tab Audio. Vui lòng mở giao diện bằng Google Chrome hoặc dùng nút Micro!');
+        }
+        throw new Error('Vui lòng tích chọn "Chia sẻ cả âm thanh của thẻ" (Also share tab audio) trong hộp thoại Chrome!');
       }
 
       await this._setupAudioPipeline(this.mediaStream, onPcmChunk);

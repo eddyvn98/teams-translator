@@ -1,5 +1,7 @@
+import base64
 import json
 import logging
+import os
 import threading
 import time
 import websocket
@@ -15,11 +17,15 @@ class TtsClient:
         self._ws = None
 
     def _get_ws_url(self) -> str:
-        # Default fallback url
-        base_url = "http://127.0.0.1:8000"
-        if self.config:
-            # Get ASR Server URL configured in App Windows settings
-            base_url = str(self.config.get("qwen_asr_url", "http://127.0.0.1:8000")).strip()
+        # Check environment variable first
+        base_url = os.getenv("ASR_BASE_URL", "").strip()
+        if not base_url and self.config:
+            # Check configured ASR Server URL, fallback to qwen_base_url
+            base_url = str(self.config.get("qwen_asr_url", "")).strip()
+            if not base_url or "127.0.0.1" in base_url or "localhost" in base_url:
+                base_url = str(self.config.get("qwen_base_url", "")).strip()
+        if not base_url:
+            base_url = "https://dich.vivutrade.io.vn/v1"
         
         # Parse http/https protocols to ws/wss protocols
         if base_url.startswith("https://"):
@@ -81,12 +87,27 @@ class TtsClient:
                         # Parse message from server
                         data = json.loads(message)
                         event = data.get("event")
-                        text = data.get("text", "").strip()
+                        text = (data.get("text") or "").strip()
+                        audio_b64 = data.get("audio_base64") or data.get("audio")
                         
-                        if event == "speak" and text:
-                            logger.info(f"[TTS Client] Received broadcast speech request: '{text}'")
-                            if self.callback:
-                                self.callback(text)
+                        if event in ("speak", "play_audio"):
+                            audio_bytes = None
+                            if audio_b64 and isinstance(audio_b64, str):
+                                try:
+                                    audio_bytes = base64.b64decode(audio_b64)
+                                except Exception as e:
+                                    logger.warning(f"[TTS Client] Failed to decode audio_base64: {e}")
+
+                            if audio_bytes or text:
+                                logger.info(
+                                    f"[TTS Client] Received broadcast speech: event='{event}', "
+                                    f"text='{text}', has_audio={bool(audio_bytes)}"
+                                )
+                                if self.callback:
+                                    try:
+                                        self.callback(text, audio_bytes=audio_bytes)
+                                    except TypeError:
+                                        self.callback(text)
                     except (websocket.WebSocketTimeoutException, socket.timeout, TimeoutError):
                         # Normal socket timeout while waiting for incoming speech requests
                         continue

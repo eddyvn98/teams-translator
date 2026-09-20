@@ -14,8 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Ensure running with .venv python (matching start_minimal.bat)
-venv_py = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+# Ensure running with .venv python
+venv_py_win = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+venv_py_posix = PROJECT_ROOT / ".venv" / "bin" / "python"
+venv_py = venv_py_win if sys.platform == "win32" else venv_py_posix
 if venv_py.exists() and Path(sys.executable).resolve() != venv_py.resolve():
     import subprocess
     sys.exit(subprocess.call([str(venv_py), __file__] + sys.argv[1:]))
@@ -24,6 +26,14 @@ def open_browser():
     time.sleep(1.2)
     url = "http://127.0.0.1:8000"
     print(f"\n[INFO] Đang mở giao diện web tại: {url}\n")
+    # On macOS, Google Chrome supports tab audio capture while Firefox/Safari do not
+    if sys.platform == "darwin" and os.path.exists("/Applications/Google Chrome.app"):
+        import subprocess
+        try:
+            subprocess.run(["open", "-a", "Google Chrome", url], check=False)
+            return
+        except Exception:
+            pass
     webbrowser.open(url)
 
 if __name__ == "__main__":

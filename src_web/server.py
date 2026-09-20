@@ -4,18 +4,22 @@ Provides real-time WebSocket audio streaming, translation, meeting history, and 
 """
 
 import asyncio
-import io
+import base64
 import json
 import logging
 import os
 import sys
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Optional
+
+import urllib.parse
+import urllib.request
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,6 +34,8 @@ from src.translator import Translator
 from src.qwen_stt import QwenSTT
 from src.reply_assistant import ReplyAssistant
 from src.meeting_store import MeetingStore
+from src.text_to_speech import TextToSpeech
+from src.tts_client import TtsClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +59,97 @@ config_mgr = ConfigManager()
 translator = Translator(config_mgr)
 qwen_stt = QwenSTT(config_mgr)
 reply_assistant = ReplyAssistant(config_mgr)
+tts_engine = TextToSpeech(config_mgr)
+
+# Active web connections tracking
+active_web_clients: set[WebSocket] = set()
+main_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _on_web_tts_client_speak(text: str, audio_bytes: bytes = None):
+    """Callback triggered when mobile speech arrives via dich.vivutrade.io.vn."""
+    logger.info(f"[Web Server TTS] Received speech request: text='{text}', has_audio={bool(audio_bytes)}")
+    # If running on a machine with local audio hardware, play locally as well
+    if audio_bytes:
+        try:
+            tts_engine.play_wav_bytes(audio_bytes, wait=False)
+        except Exception as e:
+            logger.debug(f"[Web Server TTS] Local play_wav_bytes skipped: {e}")
+    elif text:
+        try:
+            tts_engine.speak(text, wait=False)
+        except Exception as e:
+            logger.debug(f"[Web Server TTS] Local speak skipped: {e}")
+
+    if (text or audio_bytes) and main_event_loop and main_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(_notify_web_clients(text, audio_bytes=audio_bytes), main_event_loop)
+
+
+async def _notify_web_clients(text: str, audio_bytes: bytes = None):
+    """Notify active browser tabs about incoming speech from phone, including audio payload and Vietnamese translation."""
+    try:
+        clean_text = (text or "").strip()
+        audio_b64 = None
+        if audio_bytes:
+            try:
+                audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            except Exception as e:
+                logger.warning(f"[Web Server TTS] Failed to base64 encode audio: {e}")
+
+        translated_text = ""
+        if clean_text:
+            loop = asyncio.get_event_loop()
+            try:
+                translated_text = await loop.run_in_executor(
+                    None, lambda: translator.translate(clean_text, dest="vi", src="en")
+                )
+            except Exception as tr_err:
+                logger.warning(f"[Web Server TTS] Remote speech translation error: {tr_err}")
+                translated_text = ""
+
+            meeting_store.append_transcript(
+                source_lang="en",
+                source_text=f"📱 {clean_text}",
+                translated_text=translated_text,
+            )
+
+        msg = {
+            "type": "remote_speech",
+            "id": str(uuid.uuid4())[:8],
+            "source": f"📱 {clean_text}" if clean_text else "",
+            "translated": translated_text,
+            "src_lang": "en",
+            "target_lang": "vi",
+            "is_final": True,
+            "timestamp": time.time(),
+            "audio_base64": audio_b64,
+        }
+
+        for ws in list(active_web_clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[Web Server TTS] Error broadcasting to web clients: {e}")
+
+
+tts_client = TtsClient(config_manager=config_mgr, callback=_on_web_tts_client_speak)
+
+
+@app.on_event("startup")
+async def on_startup():
+    global main_event_loop
+    main_event_loop = asyncio.get_event_loop()
+    logger.info("[Web Server] Starting TTS WebSocket client connected to ASR server...")
+    tts_client.start()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("[Web Server] Stopping TTS WebSocket client...")
+    tts_client.stop()
+
 
 # Active meeting store
 DATA_DIR = PROJECT_ROOT / "data"
@@ -147,6 +244,108 @@ async def translate_text(req: TranslateRequest):
         "source_lang": req.source_lang,
         "target_lang": req.target_lang,
     }
+
+
+def _split_text_for_tts(text: str, max_chars: int = 150) -> list[str]:
+    """Split long text into sentence/clause chunks under max_chars for Google TTS."""
+    clean = text.strip()
+    if len(clean) <= max_chars:
+        return [clean]
+
+    import re
+    raw_sentences = re.split(r"([.?!;\n]+)", clean)
+    merged_sentences = []
+    i = 0
+    while i < len(raw_sentences):
+        part = raw_sentences[i]
+        punct = raw_sentences[i + 1] if i + 1 < len(raw_sentences) else ""
+        full_sentence = (part + punct).strip()
+        if full_sentence:
+            merged_sentences.append(full_sentence)
+        i += 2
+
+    chunks = []
+    current = ""
+    for sentence in merged_sentences:
+        if len(current) + len(sentence) + (1 if current else 0) <= max_chars:
+            current = f"{current} {sentence}".strip() if current else sentence
+        else:
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(sentence) > max_chars:
+                words = sentence.split()
+                sub = ""
+                for w in words:
+                    if len(w) > max_chars:
+                        if sub:
+                            chunks.append(sub)
+                            sub = ""
+                        for j in range(0, len(w), max_chars):
+                            chunks.append(w[j : j + max_chars])
+                    elif len(sub) + len(w) + 1 <= max_chars:
+                        sub = f"{sub} {w}".strip() if sub else w
+                    else:
+                        if sub:
+                            chunks.append(sub)
+                        sub = w
+                if sub:
+                    current = sub
+            else:
+                current = sentence
+    if current.strip():
+        chunks.append(current.strip())
+
+    return [c for c in chunks if any(char.isalnum() for char in c)] or [clean[:max_chars]]
+
+
+@app.get("/api/tts")
+async def text_to_speech(text: str = "", lang: str = "en"):
+    """Generate high-quality natural TTS audio (MP3) for English or Vietnamese."""
+    text = text.strip()
+    if not text:
+        return Response(status_code=400, content="Empty text")
+    if len(text) > 1000:
+        return Response(status_code=400, content="Text exceeds maximum length of 1000 characters")
+
+    tl = "en" if lang.lower().startswith("en") else ("vi" if lang.lower().startswith("vi") else lang)
+
+    cache_key = (text, tl)
+    if hasattr(app.state, "tts_cache") and cache_key in app.state.tts_cache:
+        app.state.tts_cache.move_to_end(cache_key)
+        return Response(content=app.state.tts_cache[cache_key], media_type="audio/mpeg")
+
+    try:
+        chunks = _split_text_for_tts(text, max_chars=150)
+        loop = asyncio.get_event_loop()
+
+        def _fetch_all_chunks() -> bytes:
+            audio_buffer = bytearray()
+            for chunk in chunks:
+                url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(chunk)}&tl={tl}&client=tw-ob"
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Referer": "https://translate.google.com/",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    audio_buffer.extend(resp.read())
+            return bytes(audio_buffer)
+
+        audio_bytes = await loop.run_in_executor(None, _fetch_all_chunks)
+
+        if not hasattr(app.state, "tts_cache"):
+            app.state.tts_cache = OrderedDict()
+        if len(app.state.tts_cache) >= 200:
+            app.state.tts_cache.popitem(last=False)
+        app.state.tts_cache[cache_key] = audio_bytes
+
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except Exception as e:
+        logger.error(f"TTS generation error: {e}")
+        return Response(status_code=502, content=f"TTS service unavailable: {e}")
 
 
 @app.post("/api/reply-assistant")
@@ -542,6 +741,7 @@ class AudioStreamManager:
 @app.websocket("/ws/stream")
 async def websocket_stream_endpoint(websocket: WebSocket):
     await websocket.accept()
+    active_web_clients.add(websocket)
     logger.info("WebSocket client connected")
     loop = asyncio.get_event_loop()
     manager = AudioStreamManager(websocket, loop)
@@ -615,6 +815,7 @@ async def websocket_stream_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket unexpected error: {e}")
     finally:
+        active_web_clients.discard(websocket)
         manager.stop()
 
 

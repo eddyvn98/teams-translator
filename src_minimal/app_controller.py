@@ -997,12 +997,15 @@ class TeamsTranslatorApp:
     def _notify(self, message: str):
         self.tray.showMessage("Teams Translator", message, QSystemTrayIcon.MessageIcon.Information, 2000)
 
-    def _on_tts_client_speak(self, text: str):
+    def _on_tts_client_speak(self, text: str, audio_bytes: bytes = None):
         if not getattr(self, "receive_tts_enabled", True):
             logger.info(f"[AppController] TTS Client received speech request but receive_tts is disabled: {text}")
             return
-        logger.info(f"[AppController] TTS Client received speech request: {text}")
-        self.tts.speak(text, wait=False)
+        logger.info(f"[AppController] TTS Client received speech request: text='{text}', has_audio={bool(audio_bytes)}")
+        if audio_bytes:
+            self.tts.play_wav_bytes(audio_bytes, wait=False)
+        elif text:
+            self.tts.speak(text, wait=False)
 
     def _quit(self):
         logger.info("Đang thoát...")
@@ -1099,6 +1102,10 @@ class TeamsTranslatorApp:
 
     def _run_audio_setup(self):
         """Tự động cấu hình âm thanh bằng cách chạy setup_audio_monitor.ps1 ngầm."""
+        if sys.platform != "win32":
+            self._audio_setup_done = True
+            return
+
         logger.info("Executing automatic audio configuration...")
         try:
             project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

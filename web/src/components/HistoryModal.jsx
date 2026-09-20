@@ -6,26 +6,34 @@ export default function HistoryModal({ isOpen, onClose }) {
   const [loading, setLoading] = useState(false);
   const [meetingId, setMeetingId] = useState('');
 
-  const fetchHistory = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch('/api/history');
-      if (res.ok) {
-        const data = await res.json();
-        setHistory(data.transcripts || []);
-        setMeetingId(data.meeting_id || '');
-      }
-    } catch (e) {
-      console.error('Failed to load history:', e);
-    } finally {
-      setLoading(false);
+  const updateHistory = (data) => {
+    if (data) {
+      setHistory(data.transcripts || []);
+      setMeetingId(data.meeting_id || '');
     }
   };
 
+  const handleRefresh = () => {
+    setLoading(true);
+    fetch('/api/history')
+      .then((res) => (res.ok ? res.json() : null))
+      .then(updateHistory)
+      .catch((err) => console.error('Failed to load history:', err))
+      .finally(() => setLoading(false));
+  };
+
   useEffect(() => {
-    if (isOpen) {
-      fetchHistory();
-    }
+    if (!isOpen) return;
+    let ignore = false;
+    fetch('/api/history')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!ignore) updateHistory(data);
+      })
+      .catch((err) => console.error('Failed to load history:', err));
+    return () => {
+      ignore = true;
+    };
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -35,7 +43,7 @@ export default function HistoryModal({ isOpen, onClose }) {
       .map(
         (t) =>
           `[${new Date(t.ts * 1000).toLocaleTimeString()}] (${t.source_lang || 'EN'}): ${t.source_text}\n` +
-          `-> (VI): ${t.translated_text}\n`
+          `-> (${t.target_lang || 'VI'}): ${t.translated_text}\n`
       )
       .join('\n');
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
@@ -54,10 +62,12 @@ export default function HistoryModal({ isOpen, onClose }) {
         <div className="flex items-center justify-between px-6 py-4 border-b border-[#f1f3f4]">
           <div className="flex items-center space-x-2">
             <Clock size={18} className="text-[#1a73e8]" />
-            <h2 className="text-[16px] font-medium text-[#1f1f1f]">Lịch sử cuộc họp</h2>
-            <span className="text-xs px-2 py-0.5 rounded-md bg-[#f1f3f4] text-[#5f6368]">
-              {meetingId}
-            </span>
+            <h2 className="text-[16px] font-semibold text-[#1f1f1f]">Meeting History</h2>
+            {meetingId && (
+              <span className="text-xs px-2 py-0.5 rounded-md bg-[#f1f3f4] text-[#5f6368]">
+                {meetingId}
+              </span>
+            )}
           </div>
           <div className="flex items-center space-x-2">
             <button
@@ -66,18 +76,19 @@ export default function HistoryModal({ isOpen, onClose }) {
               className="flex items-center space-x-1 px-3 py-1.5 text-xs font-medium text-[#1a73e8] hover:bg-[#e8f0fe] rounded-lg transition-colors disabled:opacity-50"
             >
               <Download size={14} />
-              <span>Xuất file txt</span>
+              <span>Export TXT</span>
             </button>
             <button
-              onClick={fetchHistory}
-              className="p-1.5 rounded-full text-[#5f6368] hover:bg-[#f1f3f4]"
-              title="Làm mới"
+              onClick={handleRefresh}
+              className="p-1.5 rounded-full text-[#5f6368] hover:bg-[#f1f3f4] transition-colors"
+              title="Refresh history"
             >
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
             </button>
             <button
               onClick={onClose}
-              className="p-1.5 rounded-full text-[#5f6368] hover:bg-[#f1f3f4]"
+              className="p-1.5 rounded-full text-[#5f6368] hover:bg-[#f1f3f4] transition-colors"
+              title="Close history modal"
             >
               <X size={18} />
             </button>
@@ -85,11 +96,11 @@ export default function HistoryModal({ isOpen, onClose }) {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+        <div className="flex-1 overflow-y-auto p-6 space-y-4 select-text">
           {history.length === 0 ? (
             <div className="py-12 text-center text-[#80868b] space-y-2">
               <MessageSquare size={32} className="mx-auto text-[#dadce0]" />
-              <p className="text-sm">Chưa có bản ghi nào trong phiên hiện tại.</p>
+              <p className="text-sm">No transcripts recorded in this session yet.</p>
             </div>
           ) : (
             history.map((item, idx) => (
