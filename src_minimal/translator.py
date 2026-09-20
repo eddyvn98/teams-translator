@@ -225,6 +225,108 @@ class Translator:
         """Translate English -> Vietnamese via Qwen MT (Disabled)."""
         return None
 
+    def _get_deepseek_api_key(self) -> str:
+        key = os.getenv("DEEPSEEK_API_KEY", "").strip() or os.getenv("DEEPSEEK_KEY", "").strip()
+        if not key and self.config:
+            key = str(self.config.get("deepseek_api_key", "")).strip()
+        if not key:
+            local_env = Path(__file__).resolve().parent.parent / ".env"
+            if local_env.exists():
+                try:
+                    for line in local_env.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line.startswith("DEEPSEEK_API_KEY=") or line.startswith("DEEPSEEK_KEY="):
+                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
+                except Exception:
+                    pass
+        return key
+
+    def _deepseek_translate(self, text: str, dest: str = "vi", src: str = "auto") -> str | None:
+        """Dịch văn bản qua DeepSeek Chat API."""
+        api_key = self._get_deepseek_api_key()
+        if not api_key:
+            return None
+
+        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+        url = f"{base_url}/chat/completions"
+
+        if src == "vi" and dest == "en":
+            system_prompt = (
+                "You are a real-time speech translator. "
+                "Translate spoken Vietnamese into natural, everyday conversational American English. "
+                "Use common colloquial American expressions, natural rhythm, and everyday phrasing (e.g. natural contractions like 'can't', 'it's', 'I'm'). "
+                "Avoid stiff, formal, or textbook phrasing. "
+                "Output ONLY the translated spoken English. Do not add quotes, brackets, or notes."
+            )
+        elif src in ("en", "auto") and dest == "vi":
+            system_prompt = (
+                "You are a real-time speech translator. "
+                "Translate spoken English into natural, everyday conversational Vietnamese (văn nói tự nhiên, đời thường, thông dụng, dễ hiểu). "
+                "Output ONLY the translated spoken Vietnamese. Do not add quotes, brackets, or notes."
+            )
+        else:
+            sl_name = "Vietnamese" if src == "vi" else ("English" if src == "en" else src)
+            tl_name = "American English" if dest == "en" else ("Vietnamese" if dest == "vi" else dest)
+            system_prompt = f"Translate spoken text directly from {sl_name} to natural conversational {tl_name}. Output ONLY direct translation."
+
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-flash").strip() or "deepseek-flash"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "thinking": {"type": "disabled"},
+            "temperature": 0.2,
+            "max_tokens": 300,
+        }
+        try:
+            resp = self._session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self._timeout("translation_deepseek_timeout", 4.0),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list):
+                    logger.warning("DeepSeek API returned empty or invalid choices list")
+                    return None
+                message = choices[0].get("message", {})
+                content = message.get("content", "").strip()
+                if content.startswith('"') and content.endswith('"') and len(content) > 2:
+                    content = content[1:-1].strip()
+                if content:
+                    logger.info("[MT] backend=deepseek-api src=%s dest=%s", src, dest)
+                    return content
+            else:
+                logger.warning("DeepSeek API status=%s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.debug("DeepSeek API error: %s", e)
+        return None
+
+    def _mymemory_translate(self, text: str, dest: str = "vi", src: str = "auto") -> str | None:
+        """Dịch qua MyMemory làm phương án dự phòng miễn phí."""
+        try:
+            from deep_translator import MyMemoryTranslator
+            s_code = "vi-VN" if src == "vi" else ("en-GB" if src == "en" else src)
+            t_code = "en-GB" if dest == "en" else ("vi-VN" if dest == "vi" else dest)
+            result = MyMemoryTranslator(source=s_code, target=t_code).translate(text)
+            if result and result.strip() and not result.lower().startswith("invalid"):
+                logger.info("[MT] backend=mymemory src=%s dest=%s", src, dest)
+                return result.strip()
+        except Exception as e:
+            logger.debug("MyMemory translation error: %s", e)
+        return None
+
     def qwen_translate_stream(self, text: str, dest: str = "vi", src: str = "en"):
         """Translate text via Qwen MT in streaming mode (generator)."""
         if not text or not text.strip():
@@ -368,20 +470,33 @@ class Translator:
             self._cache_set(cache_key, result)
             return result
 
-        # 5. Thử deep-translator library
+        # 5. Thử DeepSeek API (Fallback thông minh, văn nói đời thường chuẩn tiếng Anh Mỹ / tiếng Việt)
+        if self._get_deepseek_api_key():
+            result = self._deepseek_translate(text, dest=dest, src=src)
+            if result:
+                self._cache_set(cache_key, result)
+                return result
+
+        # 6. Thử deep-translator library
         result = self._deep_translator_translate(text, dest=dest, src=src)
         if result:
             self._cache_set(cache_key, result)
             return result
 
-        # 6. Qwen MT fallback nếu dịch sang tiếng Việt
+        # 7. MyMemory fallback (miễn phí không qua Google)
+        result = self._mymemory_translate(text, dest=dest, src=src)
+        if result:
+            self._cache_set(cache_key, result)
+            return result
+
+        # 8. Qwen MT fallback nếu dịch sang tiếng Việt
         if dest == "vi" and src in ("en", "auto"):
             qwen_result = self._qwen_translate_en_vi(text)
             if qwen_result:
                 self._cache_set(cache_key, qwen_result)
                 return qwen_result
 
-        logger.warning("[MT] Tất cả các backend dịch Google/Qwen đều không thành công cho: '%s'", text[:60])
+        logger.warning("[MT] Tất cả các backend dịch Google/DeepSeek/MyMemory đều không thành công cho: '%s'", text[:60])
         return ""
 
     def _fallback_translate(self, text: str, dest: str) -> str:

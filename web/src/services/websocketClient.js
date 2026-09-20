@@ -25,9 +25,15 @@ export class StreamWebSocketClient {
     } else {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.hostname;
-      // If running on Vite dev (5173), point to 8000
-      const port = window.location.port === '5173' ? '8000' : (window.location.port || '8000');
-      this.url = `${protocol}//${host}:${port}/ws/stream`;
+      let portPart = '';
+      if (window.location.port === '5173') {
+        const urlParams = new URLSearchParams(window.location.search);
+        const devPort = urlParams.get('ws_port') || '8080';
+        portPart = `:${devPort}`;
+      } else if (window.location.port && window.location.port !== '80' && window.location.port !== '443') {
+        portPart = `:${window.location.port}`;
+      }
+      this.url = `${protocol}//${host}${portPart}/ws/stream`;
     }
 
     try {
