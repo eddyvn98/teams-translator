@@ -22,7 +22,12 @@ logging.basicConfig(
 logger = logging.getLogger("TeamsTranslator")
 
 
+def excepthook(exc_type, exc_value, exc_tb):
+    logger.error("Uncaught exception in application:", exc_info=(exc_type, exc_value, exc_tb))
+
+
 def main():
+    sys.excepthook = excepthook
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     logger.info("=" * 50)
     logger.info("Teams Translator khoi dong...")

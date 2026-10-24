@@ -1,5 +1,6 @@
-﻿"""
-Speech-to-Text module - Nhận dạng giọng nói từ microphone
+"""
+Speech-to-Text module - Nhận dạng giọng nói từ microphone.
+Được tối ưu hóa cho Micro-Batching REST ASR với độ trễ cực thấp.
 """
 import logging
 import queue
@@ -17,45 +18,26 @@ logger = logging.getLogger(__name__)
 class SpeechToText:
     """
     Lắng nghe microphone và chuyển giọng nói thành text.
-    Hỗ trợ tiếng Anh và tiếng Việt.
+    Sử dụng kỹ thuật Micro-Batching REST API để vượt qua giới hạn vùng của tài khoản Quốc tế.
     """
 
     def __init__(self, config_manager=None):
         self.config = config_manager
-        self._recognizer = None
-        self._microphone = None
+        self._stt = QwenSTT(config_manager)
         self._listening = False
         self._thread: Optional[threading.Thread] = None
+        self._stt_threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
-        self._text_queue = queue.Queue()
         self._on_result: Optional[Callable[[str], None]] = None
         self._push_to_talk = False
-        self._qwen_stt = QwenSTT(config_manager)
+        self._audio_queue: queue.Queue = queue.Queue(maxsize=8)
 
-    def _get_recognizer(self):
-        if self._recognizer is None:
-            import speech_recognition as sr
-            self._recognizer = sr.Recognizer()
-            self._microphone = sr.Microphone()
-
-            if self.config:
-                self._recognizer.energy_threshold = self.config.get("stt_energy_threshold", 300)
-                self._recognizer.pause_threshold = self.config.get("stt_pause_threshold", 0.8)
-
-            try:
-                with self._microphone as source:
-                    self._recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            except Exception as e:
-                logger.warning(f"Không thể calibrate microphone: {e}")
-
-        return self._recognizer
+    def set_on_result(self, callback: Callable[[str], None]):
+        self._on_result = callback
 
     @property
     def is_listening(self) -> bool:
         return self._listening
-
-    def set_on_result(self, callback: Callable[[str], None]):
-        self._on_result = callback
 
     def start_listening(self, language: str = "vi-VN"):
         if self._listening:
@@ -69,84 +51,160 @@ class SpeechToText:
             daemon=True,
             name="STT-Listener"
         )
+        self._stt_threads = [
+            threading.Thread(
+                target=self._stt_loop,
+                daemon=True,
+                name=f"STT-Worker-{i+1}"
+            )
+            for i in range(2)
+        ]
         self._thread.start()
-        logger.info(f"Đã bắt đầu lắng nghe (lang={language})")
+        for t in self._stt_threads:
+            t.start()
+        logger.info(f"Đã bắt đầu lắng nghe micro (lang={language})")
 
     def stop_listening(self):
+        if not self._listening:
+            return
         self._listening = False
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        logger.info("Đã dừng lắng nghe")
+            self._thread.join(timeout=3)
+            self._thread = None
+        for t in self._stt_threads:
+            if t.is_alive():
+                t.join(timeout=3)
+        self._stt_threads = []
+        logger.info("Đã dừng lắng nghe micro")
+
+    def _stt_has_energy(self, audio: np.ndarray, threshold: float = 0.002) -> bool:
+        if audio is None or len(audio) == 0:
+            return False
+        rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float32))))
+        return rms >= threshold
 
     def _listen_loop(self, language: str):
-        recognizer = self._get_recognizer()
+        import sounddevice as sd
+        
+        try:
+            device_index = sd.default.device[0]
+            if device_index < 0:
+                raise RuntimeError("Không tìm thấy thiết bị thu âm mặc định.")
+            
+            device_info = sd.query_devices(device_index)
+            sample_rate = int(device_info.get("default_samplerate") or 16000)
+            channels = min(1, int(device_info.get("max_input_channels", 1)))
+        except Exception as e:
+            logger.error(f"Lỗi khởi động thiết bị micro: {e}")
+            self._listening = False
+            return
 
-        while not self._stop_event.is_set():
+        chunk_duration = 1.2
+        overlap_duration = 0.4
+        chunk_samples = int(sample_rate * chunk_duration)
+        overlap_samples = int(sample_rate * overlap_duration)
+        prev_tail = np.array([], dtype=np.float32)
+
+        logger.info("Bắt đầu ghi âm micro (Qwen REST STT, chunk=1.2s, overlap=0.4s)...")
+
+        while not self._stop_event.is_set() and self._listening:
             try:
                 if self._push_to_talk and not self._is_key_pressed():
                     time.sleep(0.1)
                     continue
 
-                audio = recognizer.listen(
-                    self._microphone,
-                    timeout=self.config.get("stt_timeout", 5) if self.config else 5,
-                    phrase_time_limit=self.config.get("stt_phrase_time_limit", 10) if self.config else 10
+                recording = sd.rec(
+                    chunk_samples,
+                    samplerate=sample_rate,
+                    channels=channels,
+                    device=device_index,
+                    dtype='float32'
                 )
+                sd.wait()
 
                 if self._stop_event.is_set():
                     break
 
-                threading.Thread(
-                    target=self._recognize_audio,
-                    args=(audio, language),
-                    daemon=True
-                ).start()
+                if channels > 1:
+                    recording = recording.mean(axis=1, keepdims=True)
 
+                audio_mono = recording.flatten()
+                if prev_tail.size > 0:
+                    audio_send = np.concatenate([prev_tail, audio_mono], axis=0)
+                else:
+                    audio_send = audio_mono
+
+                # VAD
+                if not self._stt_has_energy(audio_send, threshold=0.002):
+                    prev_tail = audio_mono[-overlap_samples:] if audio_mono.size > overlap_samples else audio_mono
+                    continue
+
+                lang = "en" if language.lower().startswith("en") else "vi"
+                item = (audio_send.copy(), sample_rate, lang)
+                try:
+                    self._audio_queue.put_nowait(item)
+                except queue.Full:
+                    try:
+                        self._audio_queue.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        self._audio_queue.put_nowait(item)
+                    except Exception:
+                        pass
+
+                prev_tail = audio_mono[-overlap_samples:] if audio_mono.size > overlap_samples else audio_mono
+
+            except Exception as e:
+                logger.error(f"Lỗi ghi âm micro: {e}")
+                time.sleep(1)
+
+    def _stt_loop(self):
+        """Worker gửi REST ASR tách rời khỏi capture để tránh giật lag."""
+        while not self._stop_event.is_set():
+            try:
+                audio_send, sample_rate, language = self._audio_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            try:
+                t0 = time.time()
+                text = self._stt.transcribe_audio(audio_send, sample_rate=sample_rate, language=language)
+                dt = time.time() - t0
+                if text and text.strip():
+                    logger.info(f"Micro STT ({dt:.2f}s): '{text}'")
+                    if self._on_result:
+                        self._on_result(text)
             except Exception as e:
-                if "listening" not in str(e).lower():
-                    logger.debug(f"Lỗi listen: {e}")
-                time.sleep(0.1)
-
-    def _recognize_audio(self, audio, language: str):
-        try:
-            audio_pcm = audio.get_raw_data()
-            sample_rate = int(audio.sample_rate)
-            sample_width = int(audio.sample_width)
-            if sample_width != 2:
-                raise RuntimeError(f"sample_width không hỗ trợ: {sample_width}")
-
-            pcm_int16 = np.frombuffer(audio_pcm, dtype=np.int16)
-            audio_f32 = (pcm_int16.astype(np.float32) / 32768.0).copy()
-            lang = "en" if language.lower().startswith("en") else "vi"
-            text = self._qwen_stt.transcribe_audio(audio_f32, sample_rate=sample_rate, language=lang)
-
-            if text and text.strip():
-                logger.info(f"STT nhận dạng: '{text}'")
-                if self._on_result:
-                    self._on_result(text)
-        except Exception as e:
-            logger.debug(f"Không nhận dạng được: {e}")
+                logger.warning(f"Qwen STT micro request error: {e}")
 
     def listen_once(self, language: str = "vi-VN", timeout: int = 5) -> Optional[str]:
-        recognizer = self._get_recognizer()
+        """Ghi âm một lần (chế độ batch) để tương thích ngược."""
+        import sounddevice as sd
         try:
-            audio = recognizer.listen(self._microphone, timeout=timeout, phrase_time_limit=10)
-            audio_pcm = audio.get_raw_data()
-            sample_rate = int(audio.sample_rate)
-            sample_width = int(audio.sample_width)
-            if sample_width != 2:
-                raise RuntimeError(f"sample_width không hỗ trợ: {sample_width}")
+            device_index = sd.default.device[0]
+            if device_index < 0:
+                return None
+            device_info = sd.query_devices(device_index)
+            sample_rate = int(device_info.get('default_samplerate') or 16000)
+            channels = min(1, int(device_info.get("max_input_channels", 1)))
 
-            pcm_int16 = np.frombuffer(audio_pcm, dtype=np.int16)
-            audio_f32 = (pcm_int16.astype(np.float32) / 32768.0).copy()
-            lang = "en" if language.lower().startswith("en") else "vi"
-            text = self._qwen_stt.transcribe_audio(audio_f32, sample_rate=sample_rate, language=lang)
+            recording = sd.rec(
+                int(sample_rate * timeout),
+                samplerate=sample_rate,
+                channels=channels,
+                device=device_index,
+                dtype='float32'
+            )
+            sd.wait()
+
+            if channels > 1:
+                recording = recording.mean(axis=1, keepdims=True)
+
+            text = self._stt.transcribe_audio(recording.flatten(), sample_rate=sample_rate, language="vi")
             return text
         except Exception as e:
-            logger.debug(f"listen_once lỗi: {e}")
+            logger.warning(f"listen_once lỗi: {e}", exc_info=True)
             return None
 
     def set_push_to_talk(self, enabled: bool):

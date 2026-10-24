@@ -1,0 +1,139 @@
+import base64
+import json
+import logging
+import os
+import threading
+import time
+import websocket
+
+logger = logging.getLogger(__name__)
+
+class TtsClient:
+    def __init__(self, config_manager=None, callback=None):
+        self.config = config_manager
+        self.callback = callback
+        self._is_running = False
+        self._thread = None
+        self._ws = None
+
+    def _get_ws_url(self) -> str:
+        # Check environment variable first
+        base_url = os.getenv("ASR_BASE_URL", "").strip()
+        if not base_url and self.config:
+            # Check configured ASR Server URL, fallback to qwen_base_url
+            base_url = str(self.config.get("qwen_asr_url", "")).strip()
+            if not base_url or "127.0.0.1" in base_url or "localhost" in base_url:
+                base_url = str(self.config.get("qwen_base_url", "")).strip()
+        if not base_url:
+            base_url = "https://dich.vivutrade.io.vn/v1"
+        
+        # Parse http/https protocols to ws/wss protocols
+        if base_url.startswith("https://"):
+            ws_url = "wss://" + base_url[8:].rstrip("/")
+        elif base_url.startswith("http://"):
+            ws_url = "ws://" + base_url[7:].rstrip("/")
+        else:
+            ws_url = "ws://" + base_url.rstrip("/")
+            
+        # Append specific Windows stream endpoint
+        if not ws_url.endswith("/windows/stream"):
+            # Ensure it ends with /windows/stream (clean v1 path compatibility)
+            if ws_url.endswith("/v1"):
+                ws_url = ws_url[:-3]
+            ws_url = f"{ws_url.rstrip('/')}/windows/stream"
+            
+        return ws_url
+
+    def start(self):
+        if self._is_running:
+            return
+        self._is_running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="TTS-WebSocket-Client")
+        self._thread.start()
+        logger.info("[TTS Client] WebSocket client thread started.")
+
+    def stop(self):
+        self._is_running = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._thread:
+            # We don't join strictly with blocking because websocket timeout might delay it
+            self._thread = None
+        logger.info("[TTS Client] WebSocket client thread stopped.")
+
+    def _run_loop(self):
+        import socket
+        while self._is_running:
+            ws_url = self._get_ws_url()
+            logger.info(f"[TTS Client] Connecting to: {ws_url}")
+            try:
+                # Create a persistent websocket connection with initial handshake timeout
+                self._ws = websocket.create_connection(ws_url, timeout=10)
+                # Use a small recv timeout so the loop can periodically check self._is_running
+                self._ws.settimeout(2.0)
+                logger.info("[TTS Client] Connected to TTS Server successfully.")
+                
+                # Maintain connection and receive messages
+                while self._is_running and self._ws:
+                    try:
+                        message = self._ws.recv()
+                        if not message:
+                            continue
+                        
+                        # Parse message from server
+                        data = json.loads(message)
+                        event = data.get("event")
+                        text = (data.get("text") or "").strip()
+                        audio_b64 = data.get("audio_base64") or data.get("audio")
+                        
+                        if event in ("speak", "play_audio"):
+                            audio_bytes = None
+                            if audio_b64 and isinstance(audio_b64, str):
+                                try:
+                                    audio_bytes = base64.b64decode(audio_b64)
+                                except Exception as e:
+                                    logger.warning(f"[TTS Client] Failed to decode audio_base64: {e}")
+
+                            if audio_bytes or text:
+                                logger.info(
+                                    f"[TTS Client] Received broadcast speech: event='{event}', "
+                                    f"text='{text}', has_audio={bool(audio_bytes)}"
+                                )
+                                if self.callback:
+                                    try:
+                                        self.callback(text, audio_bytes=audio_bytes)
+                                    except TypeError:
+                                        self.callback(text)
+                    except (websocket.WebSocketTimeoutException, socket.timeout, TimeoutError):
+                        # Normal socket timeout while waiting for incoming speech requests
+                        continue
+                    except (websocket.WebSocketConnectionClosedException, ConnectionResetError, BrokenPipeError):
+                        logger.warning("[TTS Client] Connection closed by server.")
+                        break
+                    except Exception as e:
+                        if not self._is_running:
+                            break
+                        # Prevent loop crash on parse errors
+                        logger.error(f"[TTS Client] Error in message loop: {e}")
+                        time.sleep(0.5)
+                        
+            except Exception as e:
+                logger.warning(f"[TTS Client] Failed to connect or connection lost: {e}. Reconnecting in 5 seconds...")
+                if self._ws:
+                    try:
+                        self._ws.close()
+                    except Exception:
+                        pass
+                    self._ws = None
+                
+                # Wait for 5 seconds, checking running state to exit quickly on shutdown
+                for _ in range(5):
+                    if not self._is_running:
+                        break
+                    time.sleep(1.0)
+                    
+        logger.info("[TTS Client] Connection loop terminated.")
